@@ -1,338 +1,537 @@
 ﻿<#
 .SYNOPSIS
-    Migrador Firebird 2.5 para 5.0 (Fortes Tecnologia) - Porta Unificada 53052
+    Migrador Firebird 2.5 para 5.0 (Fortes Tecnologia) - UI Sem Travamentos
     Sistemas suportados: AC, Ponto, AG, Patrio, Cargas e Frota.
-    Fluxo:
-      1. Deploy e registro do servico do FB 5.0 (configurado para a porta 53052 no firebird.conf).
-      2. Loop de selecao de bases e geracao de backups via FB 2.5 (porta 53052).
-      3. Parada definitiva do FB 2.5 para liberar a porta 53052.
-      4. Subida do servico do FB 5.0 na porta 53052.
-      5. Restauracao dos bancos via FB 5.0 diretamente na porta 53052.
-      6. Arquivos .ini permanecem intactos, mantendo comunicacao ativa com os terminais.
 #>
 
-# Forca o console a utilizar UTF-8
 [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding           = [System.Text.Encoding]::UTF8
 
-$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-# ==========================================
-# 1. PARAMETROS E CAMINHOS
-# ==========================================
-$PastaDestinoFB50     = "C:\Fortes\Firebird\Firebird_5_0"
-$ZipOrigemFB50        = Join-Path $ScriptDir "Binarios\Firebird_5_0.zip"
+# --- CONFIGURAÇÃO DA JANELA PRINCIPAL ---
+$Form = New-Object System.Windows.Forms.Form
+$Form.Text = "Migrador Firebird 2.5 -> 5.0 (Fortes Tecnologia)"
+$Form.Size = New-Object System.Drawing.Size(820, 750)
+$Form.StartPosition = "CenterScreen"
+$Form.FormBorderStyle = "FixedDialog"
+$Form.MaximizeBox = $false
 
-$CaminhoFB25_Gbak     = "C:\Fortes\Firebird\Firebird_2_5\bin\gbak.exe"
+$FontPadrao = New-Object System.Drawing.Font("Segoe UI", 9)
+$FontTitulo = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$FontGbak   = New-Object System.Drawing.Font("Consolas", 8)
+$Form.Font  = $FontPadrao
 
-$CaminhoFB50_Gbak     = Join-Path $PastaDestinoFB50 "gbak.exe"
-$CaminhoFB50_InstSvc  = Join-Path $PastaDestinoFB50 "instsvc.exe"
-$CaminhoFB50_InstReg  = Join-Path $PastaDestinoFB50 "instreg.exe"
+# 1. Seção: Fila de Bancos
+$GrpBancos = New-Object System.Windows.Forms.GroupBox
+$GrpBancos.Text = "Fila de Bancos Selecionados para Migração"
+$GrpBancos.Location = New-Object System.Drawing.Point(15, 10)
+$GrpBancos.Size = New-Object System.Drawing.Size(775, 160)
+$Form.Controls.Add($GrpBancos)
 
-# Porta unificada para manter compatibilidade com os terminais
-$PortaPadrao = "53052"
+$ListaBancos = New-Object System.Windows.Forms.ListView
+$ListaBancos.Location = New-Object System.Drawing.Point(15, 22)
+$ListaBancos.Size = New-Object System.Drawing.Size(620, 125)
+$ListaBancos.View = [System.Windows.Forms.View]::Details
+$ListaBancos.FullRowSelect = $true
+$ListaBancos.GridLines = $true
+$ListaBancos.Columns.Add("Sistema", 75) | Out-Null
+$ListaBancos.Columns.Add("Status", 130) | Out-Null
+$ListaBancos.Columns.Add("Caminho do Banco (.FDB)", 405) | Out-Null
+$GrpBancos.Controls.Add($ListaBancos)
 
-$UsuarioFB = "SYSDBA"
-$SenhaFB   = "masterkey"
+$BtnAdicionar = New-Object System.Windows.Forms.Button
+$BtnAdicionar.Text = "Adicionar..."
+$BtnAdicionar.Location = New-Object System.Drawing.Point(645, 22)
+$BtnAdicionar.Size = New-Object System.Drawing.Size(115, 30)
+$GrpBancos.Controls.Add($BtnAdicionar)
 
-$ServicoFB25_Server   = "FirebirdServerFortes_FB2_5"
-$ServicoFB25_Guardian = "FirebirdGuardianFortes_FB2_5"
+$BtnRemover = New-Object System.Windows.Forms.Button
+$BtnRemover.Text = "Remover"
+$BtnRemover.Location = New-Object System.Drawing.Point(645, 56)
+$BtnRemover.Size = New-Object System.Drawing.Size(115, 30)
+$GrpBancos.Controls.Add($BtnRemover)
 
-$NomeInstanciaFB50    = "Fortes_FB5_0"
-$ServicoFB50_Server   = "FirebirdServer$NomeInstanciaFB50"
+$BtnIniciar = New-Object System.Windows.Forms.Button
+$BtnIniciar.Text = "INICIAR"
+$BtnIniciar.Location = New-Object System.Drawing.Point(645, 96)
+$BtnIniciar.Size = New-Object System.Drawing.Size(115, 51)
+$BtnIniciar.BackColor = [System.Drawing.Color]::FromArgb(46, 125, 50)
+$BtnIniciar.ForeColor = [System.Drawing.Color]::White
+$BtnIniciar.Font = $FontTitulo
+$BtnIniciar.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$GrpBancos.Controls.Add($BtnIniciar)
 
-# Estrutura para armazenar a fila de migracao
-$FilaDeBancos = [System.Collections.Generic.List[PSCustomObject]]::new()
+# 2. Seção: Progresso e Etapa Atual
+$GrpProgresso = New-Object System.Windows.Forms.GroupBox
+$GrpProgresso.Text = "Status da Operação"
+$GrpProgresso.Location = New-Object System.Drawing.Point(15, 175)
+$GrpProgresso.Size = New-Object System.Drawing.Size(775, 80)
+$Form.Controls.Add($GrpProgresso)
 
-# ==========================================
-# 2. ETAPA 1: VERIFICACAO / PREPARACAO DO FB 5.0
-# ==========================================
-Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host "ETAPA 1: Preparacao do Firebird 5.0" -ForegroundColor Cyan
-Write-Host "==========================================" -ForegroundColor Cyan
+$LblStatus = New-Object System.Windows.Forms.Label
+$LblStatus.Text = "Aguardando seleção de bases para iniciar..."
+$LblStatus.Location = New-Object System.Drawing.Point(15, 20)
+$LblStatus.Size = New-Object System.Drawing.Size(745, 20)
+$LblStatus.Font = $FontTitulo
+$GrpProgresso.Controls.Add($LblStatus)
 
-if (-not (Test-Path $CaminhoFB25_Gbak)) {
-    Write-Error "O Firebird 2.5 nao foi encontrado em: $CaminhoFB25_Gbak"
-    exit 1
-}
+$ProgressBar = New-Object System.Windows.Forms.ProgressBar
+$ProgressBar.Location = New-Object System.Drawing.Point(15, 45)
+$ProgressBar.Size = New-Object System.Drawing.Size(745, 22)
+$GrpProgresso.Controls.Add($ProgressBar)
 
-# Se o gbak do 5.0 nao existir, extrai o ZIP dos binarios
-if (-not (Test-Path $CaminhoFB50_Gbak)) {
-    if (-not (Test-Path $ZipOrigemFB50)) {
-        Write-Error "Arquivo ZIP de instalacao nao encontrado em: $ZipOrigemFB50"
-        exit 1
+# 3. Seção: Monitor em Tempo Real do GBAK (Tabelas / Índices)
+$GrpGbak = New-Object System.Windows.Forms.GroupBox
+$GrpGbak.Text = "Acompanhamento do GBAK em Tempo Real (Tabelas e Índices)"
+$GrpGbak.Location = New-Object System.Drawing.Point(15, 260)
+$GrpGbak.Size = New-Object System.Drawing.Size(775, 210)
+$Form.Controls.Add($GrpGbak)
+
+$TxtGbak = New-Object System.Windows.Forms.TextBox
+$TxtGbak.Location = New-Object System.Drawing.Point(15, 22)
+$TxtGbak.Size = New-Object System.Drawing.Size(745, 175)
+$TxtGbak.Multiline = $true
+$TxtGbak.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+$TxtGbak.ReadOnly = $true
+$TxtGbak.BackColor = [System.Drawing.Color]::FromArgb(20, 20, 25)
+$TxtGbak.ForeColor = [System.Drawing.Color]::Cyan
+$TxtGbak.Font = $FontGbak
+$GrpGbak.Controls.Add($TxtGbak)
+
+# 4. Seção: Log Geral do Sistema
+$GrpLogs = New-Object System.Windows.Forms.GroupBox
+$GrpLogs.Text = "Log Geral de Operações"
+$GrpLogs.Location = New-Object System.Drawing.Point(15, 475)
+$GrpLogs.Size = New-Object System.Drawing.Size(775, 220)
+$Form.Controls.Add($GrpLogs)
+
+$TxtLogs = New-Object System.Windows.Forms.TextBox
+$TxtLogs.Location = New-Object System.Drawing.Point(15, 22)
+$TxtLogs.Size = New-Object System.Drawing.Size(745, 185)
+$TxtLogs.Multiline = $true
+$TxtLogs.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+$TxtLogs.ReadOnly = $true
+$TxtLogs.BackColor = [System.Drawing.Color]::Black
+$TxtLogs.ForeColor = [System.Drawing.Color]::LightGray
+$TxtLogs.Font = $FontGbak
+$GrpLogs.Controls.Add($TxtLogs)
+
+# --- ESTRUTURA SINCRONIZADA ---
+$SyncHash = [hashtable]::Synchronized(@{
+    StatusText    = ""
+    LogQueue      = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+    GbakQueue     = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+    ItemUpdates   = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+    Progress      = 0
+    MaxProgress   = 100
+    Concluido     = $false
+    Erro          = $null
+})
+
+# Timer regulado para 150ms com Flush em Bloco
+$TimerAtualizacao = New-Object System.Windows.Forms.Timer
+$TimerAtualizacao.Interval = 150
+$TimerAtualizacao.Add_Tick({
+    if ($SyncHash.StatusText) {
+        $LblStatus.Text = $SyncHash.StatusText
     }
 
-    Write-Host "Extraindo arquivos do Firebird 5.0 em $PastaDestinoFB50..." -ForegroundColor Yellow
-    if (-not (Test-Path $PastaDestinoFB50)) {
-        New-Item -ItemType Directory -Path $PastaDestinoFB50 -Force | Out-Null
+    $ProgressBar.Maximum = $SyncHash.MaxProgress
+    $ProgressBar.Value   = [Math]::Min($SyncHash.Progress, $SyncHash.MaxProgress)
+
+    # 1. Drena logs gerais em bloco único
+    if ($SyncHash.LogQueue.Count -gt 0) {
+        $logsParaEscrever = @()
+        [System.Threading.Monitor]::Enter($SyncHash.LogQueue.SyncRoot)
+        try {
+            $logsParaEscrever = $SyncHash.LogQueue.ToArray()
+            $SyncHash.LogQueue.Clear()
+        } finally {
+            [System.Threading.Monitor]::Exit($SyncHash.LogQueue.SyncRoot)
+        }
+        if ($logsParaEscrever.Count -gt 0) {
+            $TxtLogs.AppendText([string]::Join("`r`n", $logsParaEscrever) + "`r`n")
+        }
     }
 
-    Expand-Archive -Path $ZipOrigemFB50 -DestinationPath $PastaDestinoFB50 -Force
-    Write-Host "Arquivos descompactados com sucesso!" -ForegroundColor Green
-}
-
-# Garante a chave de registro do FB 5.0
-if (Test-Path $CaminhoFB50_InstReg) {
-    & $CaminhoFB50_InstReg install "$PastaDestinoFB50" 2>$null | Out-Null
-}
-
-# Registra o servico do FB 5.0 (sem iniciar ainda para nao colidir na porta 53052)
-$ServicoFB50 = Get-Service -Name $ServicoFB50_Server -ErrorAction SilentlyContinue
-
-if (-not $ServicoFB50) {
-    Write-Host "Registrando servico do Firebird 5.0 ($ServicoFB50_Server)..." -ForegroundColor Yellow
-    if (Test-Path $CaminhoFB50_InstSvc) {
-        & $CaminhoFB50_InstSvc install -auto -name $NomeInstanciaFB50
-        Start-Sleep -Seconds 2
-    } else {
-        Write-Error "instsvc.exe nao encontrado para registrar o servico."
-        exit 1
-    }
-}
-
-# Liberacao da porta no Firewall
-Write-Host "Verificando regra de Firewall para a porta $PortaPadrao..." -ForegroundColor Yellow
-$NomeRegra = "Firebird Fortes (Porta $PortaPadrao)"
-netsh advfirewall firewall delete rule name="$NomeRegra" >$null 2>&1
-netsh advfirewall firewall add rule name="$NomeRegra" dir=in action=allow protocol=TCP localport=$PortaPadrao profile=any >$null
-
-Write-Host "[OK] Firewall validado para a porta $PortaPadrao." -ForegroundColor Green
-
-# ==========================================
-# 3. ETAPA 2: FILA DE BASES PARA MIGRAR
-# ==========================================
-Add-Type -AssemblyName System.Windows.Forms
-
-$ColetandoBancos = $true
-$Contador = 0
-
-while ($ColetandoBancos) {
-    $Contador++
-
-    Write-Host "`n==========================================" -ForegroundColor Cyan
-    Write-Host "SELECAO DO SISTEMA / BANCO (BASE #$Contador)" -ForegroundColor Cyan
-    Write-Host "==========================================" -ForegroundColor Cyan
-
-    $OpenFileDialog = New-Object System.Windows.Forms.OpenFileDialog
-    $OpenFileDialog.Title = "Selecione o arquivo .FDB do sistema para migrar"
-    $OpenFileDialog.InitialDirectory = "C:\Fortes"
-    $OpenFileDialog.Filter = "Banco Firebird (*.fdb)|*.fdb|Todos os Arquivos (*.*)|*.*"
-
-    if ($OpenFileDialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
-        Write-Host "Selecao finalizada/cancelada pelo operador." -ForegroundColor Yellow
-        break
+    # 2. Drena saída do GBAK em bloco único e limita tamanho do buffer na tela
+    if ($SyncHash.GbakQueue.Count -gt 0) {
+        $gbakParaEscrever = @()
+        [System.Threading.Monitor]::Enter($SyncHash.GbakQueue.SyncRoot)
+        try {
+            $gbakParaEscrever = $SyncHash.GbakQueue.ToArray()
+            $SyncHash.GbakQueue.Clear()
+        } finally {
+            [System.Threading.Monitor]::Exit($SyncHash.GbakQueue.SyncRoot)
+        }
+        if ($gbakParaEscrever.Count -gt 0) {
+            # Evita sobrecarga de texto infinito mantendo os últimos 30.000 caracteres
+            if ($TxtGbak.TextLength -gt 30000) {
+                $TxtGbak.Text = $TxtGbak.Text.Substring($TxtGbak.TextLength - 15000)
+            }
+            $TxtGbak.AppendText([string]::Join("`r`n", $gbakParaEscrever) + "`r`n")
+        }
     }
 
-    $BancoOrigem = $OpenFileDialog.FileName
-    $DiretorioDados = [System.IO.Path]::GetDirectoryName($BancoOrigem)
-    $NomeArquivoOrigem = [System.IO.Path]::GetFileNameWithoutExtension($BancoOrigem)
-    $CaminhoMinusculo = $BancoOrigem.ToLower()
+    # 3. Drena atualizações de status das linhas da tabela
+    if ($SyncHash.ItemUpdates.Count -gt 0) {
+        $updatesParaProcessar = @()
+        [System.Threading.Monitor]::Enter($SyncHash.ItemUpdates.SyncRoot)
+        try {
+            $updatesParaProcessar = $SyncHash.ItemUpdates.ToArray()
+            $SyncHash.ItemUpdates.Clear()
+        } finally {
+            [System.Threading.Monitor]::Exit($SyncHash.ItemUpdates.SyncRoot)
+        }
 
-    # Deteccao de modulo
-    if ($NomeArquivoOrigem -like "*Ponto*" -or $CaminhoMinusculo -match "\\ponto\\") {
-        $Sistema = "Ponto"
-    } elseif ($NomeArquivoOrigem -like "*Patrio*" -or $CaminhoMinusculo -match "\\patrio\\") {
-        $Sistema = "Patrio"
-    } elseif ($NomeArquivoOrigem -like "*Cargas*" -or $CaminhoMinusculo -match "\\cargas\\") {
-        $Sistema = "Cargas"
-    } elseif ($NomeArquivoOrigem -like "*Frota*" -or $CaminhoMinusculo -match "\\frota\\") {
-        $Sistema = "Frota"
-    } elseif ($NomeArquivoOrigem -match "(^|_)AG($|_)" -or $CaminhoMinusculo -match "\\ag\\") {
-        $Sistema = "AG"
-    } else {
-        $Sistema = "AC"
-    }
-
-    $NomeFinalBanco    = "$Sistema.fdb"
-    $ArquivoBackupTemp = Join-Path $DiretorioDados "temp_migracao_$Sistema.fbk"
-    $ArquivoBancoNovo  = Join-Path $DiretorioDados "temp_fb50_$Sistema.fdb"
-    $ArquivoBancoFinal = Join-Path $DiretorioDados $NomeFinalBanco
-
-    Write-Host "Sistema Detectado: $Sistema" -ForegroundColor Green
-    Write-Host "Caminho da Base:   $BancoOrigem"
-
-    # Verificacao ODS
-    try {
-        $Stream = [System.IO.File]::OpenRead($BancoOrigem)
-        $Buffer = New-Object byte[] 32
-        $Stream.Read($Buffer, 0, 32) | Out-Null
-        $Stream.Close()
-
-        $ODS_Major = [int]$Buffer[18]
-        $ODS_Minor = [int]$Buffer[20]
-
-        if ($ODS_Major -ge 13) {
-            Write-Host "`n[AVISO] Base ja migrada para o FB 5.0 (ODS $ODS_Major.$ODS_Minor)!" -ForegroundColor Green
-            $Forcar = Read-Host "Deseja incluir essa base mesmo assim (S/N)?"
-            if ($Forcar -notmatch "^[sS]") {
-                $PerguntaOutro = Read-Host "`nDeseja selecionar OUTRO sistema (S/N)?"
-                $ColetandoBancos = ($PerguntaOutro -match "^[sS]")
-                continue
+        foreach ($up in $updatesParaProcessar) {
+            $idx = $up.Index
+            if ($idx -lt $ListaBancos.Items.Count) {
+                $item = $ListaBancos.Items[$idx]
+                $item.SubItems[1].Text = $up.Status
+                
+                switch ($up.Tipo) {
+                    "Processando" {
+                        $item.BackColor = [System.Drawing.Color]::FromArgb(255, 249, 196)
+                        $item.ForeColor = [System.Drawing.Color]::FromArgb(100, 70, 0)
+                    }
+                    "Concluido" {
+                        $item.BackColor = [System.Drawing.Color]::FromArgb(200, 230, 201)
+                        $item.ForeColor = [System.Drawing.Color]::FromArgb(27, 94, 32)
+                        $item.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+                    }
+                    "Erro" {
+                        $item.BackColor = [System.Drawing.Color]::FromArgb(255, 205, 210)
+                        $item.ForeColor = [System.Drawing.Color]::FromArgb(183, 28, 28)
+                    }
+                }
             }
         }
-    } catch {
-        Write-Host "Nao foi possivel inspecionar os bytes do cabecalho, prosseguindo..." -ForegroundColor DarkGray
     }
 
-    # Validacao de espaco em disco (2.1x)
-    $TamanhoBytes = (Get-Item $BancoOrigem).Length
-    $EspacoNecessarioBytes = [math]::Round($TamanhoBytes * 2.1)
-    $LetraUnidade = [System.IO.Path]::GetPathRoot($BancoOrigem).Replace("\", "")
-    $UnidadeDisco = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object { $_.DeviceID -eq $LetraUnidade }
+    # Mantém a janela respondendo ao sistema operacional
+    [System.Windows.Forms.Application]::DoEvents()
 
-    if ($UnidadeDisco -and ($UnidadeDisco.FreeSpace -lt $EspacoNecessarioBytes)) {
-        Write-Host "[ERRO CRITICO] Espaco insuficiente no disco $LetraUnidade!" -ForegroundColor Red
-        Write-Host "Necessarios: $([math]::Round($EspacoNecessarioBytes / 1GB, 2)) GB | Livres: $([math]::Round($UnidadeDisco.FreeSpace / 1GB, 2)) GB" -ForegroundColor Red
-        $PerguntaOutro = Read-Host "`nDeseja tentar outro sistema (S/N)?"
-        $ColetandoBancos = ($PerguntaOutro -match "^[sS]")
-        continue
-    }
+    if ($SyncHash.Concluido) {
+        $TimerAtualizacao.Stop()
+        $BtnAdicionar.Enabled = $true
+        $BtnRemover.Enabled   = $true
+        $BtnIniciar.Enabled   = $true
 
-    # Adiciona a fila de trabalho
-    $FilaDeBancos.Add([PSCustomObject]@{
-        Sistema           = $Sistema
-        BancoOrigem       = $BancoOrigem
-        ArquivoBackupTemp = $ArquivoBackupTemp
-        ArquivoBancoNovo  = $ArquivoBancoNovo
-        ArquivoBancoFinal = $ArquivoBancoFinal
-    })
-
-    Write-Host "[OK] Base adicionada a fila de migracao." -ForegroundColor Green
-
-    $PerguntaOutro = Read-Host "`nDeseja adicionar MAIS UM sistema a fila (ex: Ponto, Patrio, AG, Frota) (S/N)?"
-    $ColetandoBancos = ($PerguntaOutro -match "^[sS]")
-}
-
-if ($FilaDeBancos.Count -eq 0) {
-    Write-Host "`nNenhuma base foi selecionada para migracao. Finalizando operacao..." -ForegroundColor Yellow
-    exit 0
-}
-
-# ==========================================
-# 4. ETAPA 3: GERAR BACKUPS (FB 2.5 - PORTA 53052)
-# ==========================================
-Write-Host "`n==========================================" -ForegroundColor Cyan
-Write-Host "ETAPA 3: Extraindo Backups via Firebird 2.5" -ForegroundColor Cyan
-Write-Host "==========================================" -ForegroundColor Cyan
-
-# Garante que o servico 2.5 esta ativo para fazer a extracao
-Write-Host "Reiniciando Firebird 2.5 para liberar conexoes presas..." -ForegroundColor Yellow
-if (Get-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue) {
-    Stop-Service -Name $ServicoFB25_Guardian -Force -ErrorAction SilentlyContinue
-}
-if (Get-Service -Name $ServicoFB25_Server -ErrorAction SilentlyContinue) {
-    Restart-Service -Name $ServicoFB25_Server -Force
-}
-if (Get-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue) {
-    Start-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue
-}
-
-foreach ($item in $FilaDeBancos) {
-    Write-Host "`nExtraindo backup do sistema: $($item.Sistema)..." -ForegroundColor Yellow
-    
-    $PularBackup = $false
-    if (Test-Path $item.ArquivoBackupTemp) {
-        $TamanhoMB = [math]::Round(((Get-Item $item.ArquivoBackupTemp).Length / 1MB), 2)
-        Write-Host "[CHECKPOINT] Backup encontrado: $($item.ArquivoBackupTemp) ($TamanhoMB MB)" -ForegroundColor Yellow
-        $Escolha = Read-Host "Deseja APROVEITAR esse backup ja existente (S/N)?"
-        if ($Escolha -match "^[sS]") {
-            $PularBackup = $true
+        if ($SyncHash.Erro) {
+            [System.Windows.Forms.MessageBox]::Show("A migração falhou:`n$($SyncHash.Erro)", "Erro", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
         } else {
-            Remove-Item $item.ArquivoBackupTemp -Force
+            [System.Windows.Forms.MessageBox]::Show("Processo de migração concluído com sucesso!", "Sucesso", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        }
+    }
+})
+
+# --- EVENTOS DOS BOTÕES ---
+$BtnAdicionar.Add_Click({
+    $Dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $Dialog.Title = "Selecione a base Firebird (.FDB)"
+    $Dialog.InitialDirectory = "C:\Fortes"
+    $Dialog.Filter = "Banco Firebird (*.fdb)|*.fdb|Todos os Arquivos (*.*)|*.*"
+
+    if ($Dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $Caminho = $Dialog.FileName
+        $Nome = [System.IO.Path]::GetFileNameWithoutExtension($Caminho)
+        $Minusculo = $Caminho.ToLower()
+
+        if ($Nome -like "*Ponto*" -or $Minusculo -match "\\ponto\\") {
+            $Sistema = "Ponto"
+        } elseif ($Nome -like "*Patrio*" -or $Minusculo -match "\\patrio\\") {
+            $Sistema = "Patrio"
+        } elseif ($Nome -like "*Cargas*" -or $Minusculo -match "\\cargas\\") {
+            $Sistema = "Cargas"
+        } elseif ($Nome -like "*Frota*" -or $Minusculo -match "\\frota\\") {
+            $Sistema = "Frota"
+        } elseif ($Nome -match "(^|_)AG($|_)" -or $Minusculo -match "\\ag\\") {
+            $Sistema = "AG"
+        } else {
+            $Sistema = "AC"
+        }
+
+        # Validação preventiva de ODS
+        try {
+            $Stream = [System.IO.File]::OpenRead($Caminho)
+            $Buf = New-Object byte[] 32
+            $Stream.Read($Buf, 0, 32) | Out-Null
+            $Stream.Close()
+            if ([int]$Buf[18] -ge 13) {
+                $Res = [System.Windows.Forms.MessageBox]::Show("A base de dados selecionada já está no formato do Firebird 5.0 (ODS $([int]$Buf[18])). Deseja incluí-la mesmo assim?", "Aviso", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                if ($Res -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+            }
+        } catch {}
+
+        $Item = New-Object System.Windows.Forms.ListViewItem($Sistema)
+        $Item.SubItems.Add("Aguardando...") | Out-Null
+        $Item.SubItems.Add($Caminho) | Out-Null
+        $ListaBancos.Items.Add($Item) | Out-Null
+    }
+})
+
+$BtnRemover.Add_Click({
+    foreach ($Item in $ListaBancos.SelectedItems) {
+        $ListaBancos.Items.Remove($Item)
+    }
+})
+
+$BtnIniciar.Add_Click({
+    if ($ListaBancos.Items.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Selecione pelo menos uma base na fila antes de iniciar.", "Atenção", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        return
+    }
+
+    $Confirmar = [System.Windows.Forms.MessageBox]::Show("Deseja iniciar a migração de $($ListaBancos.Items.Count) base(s)?`nCertifique-se de que os sistemas estão fechados nos terminais.", "Confirmar Início", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($Confirmar -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+    $BtnAdicionar.Enabled = $false
+    $BtnRemover.Enabled   = $false
+    $BtnIniciar.Enabled   = $false
+    $TxtLogs.Clear()
+    $TxtGbak.Clear()
+
+    $Fila = @()
+    for ($i = 0; $i -lt $ListaBancos.Items.Count; $i++) {
+        $Item = $ListaBancos.Items[$i]
+        $Item.SubItems[1].Text = "Na Fila"
+        $Item.BackColor = [System.Drawing.Color]::White
+        $Item.ForeColor = [System.Drawing.Color]::Black
+
+        $Sis = $Item.Text
+        $Cam = $Item.SubItems[2].Text
+        $Dir = [System.IO.Path]::GetDirectoryName($Cam)
+
+        $Fila += [PSCustomObject]@{
+            Index             = $i
+            Sistema           = $Sis
+            BancoOrigem       = $Cam
+            ArquivoBackupTemp = Join-Path $Dir "temp_migracao_$Sis.fbk"
+            ArquivoBancoNovo  = Join-Path $Dir "temp_fb50_$Sis.fdb"
+            ArquivoBancoFinal = Join-Path $Dir "$Sis.fdb"
         }
     }
 
-    if (-not $PularBackup) {
-        $ConexaoFB25 = "localhost/${PortaPadrao}:$($item.BancoOrigem)"
-        & $CaminhoFB25_Gbak -b -v -g "$ConexaoFB25" "$($item.ArquivoBackupTemp)" -user $UsuarioFB -password $SenhaFB
+    $SyncHash.Concluido   = $false
+    $SyncHash.Erro        = $null
+    $SyncHash.Progress    = 0
+    $SyncHash.MaxProgress = 2 + ($Fila.Count * 2) + 1
+    $SyncHash.StatusText  = "Iniciando checagens de ambiente..."
 
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $item.ArquivoBackupTemp)) {
-            Write-Error "Falha ao extrair backup do sistema $($item.Sistema)."
-            exit 1
+    $TimerAtualizacao.Start()
+
+    # --- SCRIPT WORKER ---
+    $ScriptBlockWorker = {
+        param($Sync, $Fila, $ScriptDir)
+
+        function Log($txt) {
+            $timestamp = (Get-Date).ToString("HH:mm:ss")
+            $Sync.LogQueue.Add("[$timestamp] $txt") | Out-Null
         }
-        Write-Host "[OK] Backup do $($item.Sistema) finalizado com sucesso." -ForegroundColor Green
+
+        function ExecutarGbakComMonitor($executavel, $argumentos) {
+            $logTemp = [System.IO.Path]::GetTempFileName()
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "cmd.exe"
+            $psi.Arguments = "/c `"`"$executavel`" $argumentos > `"$logTemp`" 2>&1`""
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+
+            $proc = [System.Diagnostics.Process]::Start($psi)
+
+            $lastPos = 0
+            while (-not $proc.HasExited) {
+                if (Test-Path $logTemp) {
+                    try {
+                        $fs = New-Object System.IO.FileStream($logTemp, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                        if ($fs.Length -gt $lastPos) {
+                            $fs.Seek($lastPos, [System.IO.SeekOrigin]::Begin) | Out-Null
+                            $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::Default)
+                            while (-not $sr.EndOfStream) {
+                                $linha = $sr.ReadLine()
+                                if ($linha) {
+                                    $Sync.GbakQueue.Add($linha) | Out-Null
+                                }
+                            }
+                            $lastPos = $fs.Position
+                            $sr.Close()
+                        }
+                        $fs.Close()
+                    } catch {}
+                }
+                Start-Sleep -Milliseconds 250
+            }
+
+            if (Test-Path $logTemp) {
+                try {
+                    $fs = New-Object System.IO.FileStream($logTemp, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                    if ($fs.Length -gt $lastPos) {
+                        $fs.Seek($lastPos, [System.IO.SeekOrigin]::Begin) | Out-Null
+                        $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::Default)
+                        while (-not $sr.EndOfStream) {
+                            $linha = $sr.ReadLine()
+                            if ($linha) {
+                                $Sync.GbakQueue.Add($linha) | Out-Null
+                            }
+                        }
+                        $sr.Close()
+                    }
+                    $fs.Close()
+                    Remove-Item $logTemp -Force -ErrorAction SilentlyContinue
+                } catch {}
+            }
+
+            return $proc.ExitCode
+        }
+
+        try {
+            $PastaDestinoFB50     = "C:\Fortes\Firebird\Firebird_5_0"
+            $ZipOrigemFB50        = Join-Path $ScriptDir "Binarios\Firebird_5_0.zip"
+            $CaminhoFB25_Gbak     = "C:\Fortes\Firebird\Firebird_2_5\bin\gbak.exe"
+            $CaminhoFB50_Gbak     = Join-Path $PastaDestinoFB50 "gbak.exe"
+            $CaminhoFB50_InstSvc  = Join-Path $PastaDestinoFB50 "instsvc.exe"
+            $CaminhoFB50_InstReg  = Join-Path $PastaDestinoFB50 "instreg.exe"
+            $PortaPadrao          = "53052"
+            $UsuarioFB            = "SYSDBA"
+            $SenhaFB              = "masterkey"
+            $ServicoFB25_Server   = "FirebirdServerFortes_FB2_5"
+            $ServicoFB25_Guardian = "FirebirdGuardianFortes_FB2_5"
+            $NomeInstanciaFB50    = "Fortes_FB5_0"
+            $ServicoFB50_Server   = "FirebirdServer$NomeInstanciaFB50"
+
+            # 1. Configuração do FB 5.0
+            $Sync.StatusText = "Etapa 1: Preparando o Firebird 5.0..."
+            Log "Checando binários do Firebird 5.0..."
+
+            if (-not (Test-Path $CaminhoFB50_Gbak)) {
+                if (-not (Test-Path $ZipOrigemFB50)) {
+                    throw "Pacote ZIP não encontrado em: $ZipOrigemFB50"
+                }
+                Log "Extraindo binários para $PastaDestinoFB50..."
+                if (-not (Test-Path $PastaDestinoFB50)) { New-Item -ItemType Directory -Path $PastaDestinoFB50 -Force | Out-Null }
+                Expand-Archive -Path $ZipOrigemFB50 -DestinationPath $PastaDestinoFB50 -Force
+                Log "Extração finalizada."
+            }
+
+            if (Test-Path $CaminhoFB50_InstReg) {
+                & $CaminhoFB50_InstReg install "$PastaDestinoFB50" 2>$null | Out-Null
+            }
+
+            $ServicoFB50 = Get-Service -Name $ServicoFB50_Server -ErrorAction SilentlyContinue
+            if (-not $ServicoFB50) {
+                Log "Registrando serviço do Firebird 5.0..."
+                & $CaminhoFB50_InstSvc install -auto -name $NomeInstanciaFB50
+                Start-Sleep -Seconds 2
+            }
+
+            Log "Garantindo porta $PortaPadrao no Firewall do Windows..."
+            $NomeRegra = "Firebird Fortes (Porta $PortaPadrao)"
+            netsh advfirewall firewall delete rule name="$NomeRegra" >$null 2>&1
+            netsh advfirewall firewall add rule name="$NomeRegra" dir=in action=allow protocol=TCP localport=$PortaPadrao profile=any >$null
+            Log "Firewall validado para a porta $PortaPadrao."
+
+            $Sync.Progress++
+
+            # 2. Backups via FB 2.5
+            Log "Reiniciando Firebird 2.5 para fechar conexões ativas..."
+            if (Get-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue) { Stop-Service -Name $ServicoFB25_Guardian -Force -ErrorAction SilentlyContinue }
+            if (Get-Service -Name $ServicoFB25_Server -ErrorAction SilentlyContinue) { Restart-Service -Name $ServicoFB25_Server -Force }
+            if (Get-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue) { Start-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue }
+
+            foreach ($item in $Fila) {
+                $Sync.StatusText = "Extraindo backup do sistema: $($item.Sistema)..."
+                Log "Iniciando gbak (Backup) para $($item.Sistema)..."
+                $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Extraindo Backup..."; Tipo = "Processando" }) | Out-Null
+
+                $ConexaoFB25 = "localhost/${PortaPadrao}:$($item.BancoOrigem)"
+                $argsGbak = "-b -v -g `"$ConexaoFB25`" `"$($item.ArquivoBackupTemp)`" -user $UsuarioFB -password $SenhaFB"
+                
+                $exitCode = ExecutarGbakComMonitor $CaminhoFB25_Gbak $argsGbak
+
+                if ($exitCode -ne 0 -or -not (Test-Path $item.ArquivoBackupTemp)) {
+                    $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Erro no Backup"; Tipo = "Erro" }) | Out-Null
+                    throw "Falha ao extrair backup da base $($item.Sistema)."
+                }
+                
+                Log "Backup do $($item.Sistema) extraído com sucesso."
+                $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Backup Concluído"; Tipo = "Processando" }) | Out-Null
+                $Sync.Progress++
+            }
+
+            # 3. Transição dos Serviços
+            $Sync.StatusText = "Realizando transição de motores na porta $PortaPadrao..."
+            Log "Parando e desinstalando serviços do Firebird 2.5..."
+            Stop-Service -Name $ServicoFB25_Guardian -Force -ErrorAction SilentlyContinue
+            Stop-Service -Name $ServicoFB25_Server -Force -ErrorAction SilentlyContinue
+            sc.exe delete $ServicoFB25_Guardian | Out-Null
+            sc.exe delete $ServicoFB25_Server | Out-Null
+            Start-Sleep -Seconds 2
+
+            Log "Iniciando serviço do Firebird 5.0 na porta $PortaPadrao..."
+            Start-Service -Name $ServicoFB50_Server
+            Start-Sleep -Seconds 3
+
+            if ((Get-Service -Name $ServicoFB50_Server).Status -ne "Running") {
+                throw "O Firebird 5.0 não conseguiu iniciar na porta $PortaPadrao. Verifique o firebird.conf."
+            }
+            Log "Firebird 5.0 operacional na porta $PortaPadrao."
+            $Sync.Progress++
+
+            # 4. Restaurações via FB 5.0
+            foreach ($item in $Fila) {
+                $Sync.StatusText = "Restaurando base do sistema: $($item.Sistema)..."
+                Log "Iniciando gbak (Restore) de $($item.Sistema) (ODS 13.x, Page Size 8192)..."
+                $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Restaurando..."; Tipo = "Processando" }) | Out-Null
+
+                if (Test-Path $item.ArquivoBancoNovo) { Remove-Item $item.ArquivoBancoNovo -Force }
+
+                $ConexaoFB50 = "localhost/${PortaPadrao}:$($item.ArquivoBancoNovo)"
+                $argsGbakRestore = "-c -v -p 8192 `"$($item.ArquivoBackupTemp)`" `"$ConexaoFB50`" -user $UsuarioFB -password $SenhaFB"
+
+                $exitCode = ExecutarGbakComMonitor $CaminhoFB50_Gbak $argsGbakRestore
+
+                if ($exitCode -ne 0 -or -not (Test-Path $item.ArquivoBancoNovo)) {
+                    $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Erro no Restore"; Tipo = "Erro" }) | Out-Null
+                    throw "Falha ao restaurar $($item.Sistema) no Firebird 5.0."
+                }
+
+                if (Test-Path $item.ArquivoBackupTemp) { Remove-Item $item.ArquivoBackupTemp -Force }
+
+                if (Test-Path $item.ArquivoBancoFinal) {
+                    $BackupAntigo = "$($item.ArquivoBancoFinal)_OLD_$((Get-Date).ToString('yyyyMMdd_HHmmss'))"
+                    Rename-Item -Path $item.ArquivoBancoFinal -NewName (Split-Path $BackupAntigo -Leaf) -Force
+                    Log "Base anterior arquivada em: $(Split-Path $BackupAntigo -Leaf)"
+                }
+
+                Move-Item -Path $item.ArquivoBancoNovo -Destination $item.ArquivoBancoFinal -Force
+                Log "Base $($item.Sistema) disponível em: $($item.ArquivoBancoFinal)"
+
+                # Linha finalizada: status muda e fica verde na interface
+                $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Concluído [OK]"; Tipo = "Concluido" }) | Out-Null
+                $Sync.Progress++
+            }
+
+            $Sync.StatusText = "Migração concluída com sucesso!"
+            Log "Todas as bases foram migradas e os arquivos .INI mantidos intactos."
+        } catch {
+            $Sync.Erro = $_.Exception.Message
+            Log "[FALHA CRÍTICA] $($_.Exception.Message)"
+            $Sync.StatusText = "Erro durante o processamento."
+        } finally {
+            $Sync.Concluido = $true
+        }
     }
-}
 
-# ==========================================
-# 5. ETAPA 4: VIRADA DE CHAVE DOS SERVICOS
-# ==========================================
-Write-Host "`n==========================================" -ForegroundColor Cyan
-Write-Host "ETAPA 4: Transicao de Motores na Porta $PortaPadrao" -ForegroundColor Cyan
-Write-Host "==========================================" -ForegroundColor Cyan
+    $PowerShellWorker = [powershell]::Create().AddScript($ScriptBlockWorker).AddArgument($SyncHash).AddArgument($Fila).AddArgument($ScriptDir)
+    $PowerShellWorker.BeginInvoke() | Out-Null
+})
 
-Write-Host "Parando e desinstalando servicos do Firebird 2.5..." -ForegroundColor Yellow
-Stop-Service -Name $ServicoFB25_Guardian -Force -ErrorAction SilentlyContinue
-Stop-Service -Name $ServicoFB25_Server -Force -ErrorAction SilentlyContinue
-
-sc.exe delete $ServicoFB25_Guardian | Out-Null
-sc.exe delete $ServicoFB25_Server | Out-Null
-Start-Sleep -Seconds 2
-
-Write-Host "Iniciando o Firebird 5.0 na porta unificada $PortaPadrao..." -ForegroundColor Yellow
-Start-Service -Name $ServicoFB50_Server
-Start-Sleep -Seconds 3
-
-# Valida se subiu
-$StatusFB50 = (Get-Service -Name $ServicoFB50_Server).Status
-if ($StatusFB50 -ne "Running") {
-    Write-Error "O Firebird 5.0 nao conseguiu iniciar. Verifique se o firebird.conf esta configurado com a porta $PortaPadrao."
-    exit 1
-}
-Write-Host "[OK] Firebird 5.0 ativo e escutando na porta $PortaPadrao!" -ForegroundColor Green
-
-# ==========================================
-# 6. ETAPA 5: RESTAURAR BASES NO FB 5.0
-# ==========================================
-Write-Host "`n==========================================" -ForegroundColor Cyan
-Write-Host "ETAPA 5: Restaurando Bases no Firebird 5.0" -ForegroundColor Cyan
-Write-Host "==========================================" -ForegroundColor Cyan
-
-foreach ($item in $FilaDeBancos) {
-    Write-Host "`nRestaurando sistema: $($item.Sistema)..." -ForegroundColor Yellow
-
-    if (Test-Path $item.ArquivoBancoNovo) {
-        Remove-Item $item.ArquivoBancoNovo -Force
-    }
-
-    $ConexaoFB50 = "localhost/${PortaPadrao}:$($item.ArquivoBancoNovo)"
-    & $CaminhoFB50_Gbak -c -v -p 8192 "$($item.ArquivoBackupTemp)" "$ConexaoFB50" -user $UsuarioFB -password $SenhaFB
-
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $item.ArquivoBancoNovo)) {
-        Write-Error "Falha ao restaurar banco $($item.Sistema) no Firebird 5.0."
-        exit 1
-    }
-
-    # Limpa arquivo temporario de backup
-    if (Test-Path $item.ArquivoBackupTemp) {
-        Remove-Item $item.ArquivoBackupTemp -Force
-    }
-
-    # Preserva o arquivo antigo caso exista
-    if (Test-Path $item.ArquivoBancoFinal) {
-        $DataHora = Get-Date -Format "yyyyMMdd_HHmmss"
-        $BackupAntigo = "$($item.ArquivoBancoFinal)_OLD_${DataHora}"
-        Write-Host "Guardando copia de seguranca em: $BackupAntigo" -ForegroundColor Yellow
-        Rename-Item -Path $item.ArquivoBancoFinal -NewName (Split-Path $BackupAntigo -Leaf) -Force
-    }
-
-    Move-Item -Path $item.ArquivoBancoNovo -Destination $item.ArquivoBancoFinal -Force
-    Write-Host "[OK] Base do $($item.Sistema) migrada com sucesso em: $($item.ArquivoBancoFinal)" -ForegroundColor Green
-}
-
-# ==========================================
-# 7. RESUMO FINAL
-# ==========================================
-Write-Host "`n========================================================" -ForegroundColor Green
-Write-Host "           MIGRACAO CONCLUIDA COM SUCESSO!              " -ForegroundColor Green
-Write-Host "========================================================" -ForegroundColor Green
-Write-Host "Porta unificada mantida: $PortaPadrao (Terminais nao necessitam alteracao)" -ForegroundColor Cyan
-Write-Host "Arquivos de configuracao (.INI): Mantidos intactos sem necessidade de alteracao.`n" -ForegroundColor Cyan
-Write-Host "Bancos migrados:" -ForegroundColor Yellow
-foreach ($item in $FilaDeBancos) {
-    Write-Host " - $($item.Sistema): $($item.ArquivoBancoFinal)" -ForegroundColor Green
-}
-Write-Host "========================================================" -ForegroundColor Green
+# Exibe o formulário
+$Form.ShowDialog() | Out-Null
