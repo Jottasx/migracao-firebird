@@ -1,90 +1,111 @@
-# Migrador Automatizado Firebird 2.5 para 5.0 - Sistemas Fortes
+# Utilitário de Migração Firebird 2.5 para 5.0 (Fortes Tecnologia) - Edição GUI
 
-Script nativo em PowerShell/Batch desenvolvido para automatizar a migração das bases de dados dos sistemas Fortes Tecnologia (AC, Ponto, AG, Patrio, Cargas e Frota) do Firebird 2.5.5 (legado) para o Firebird 5.0.3, garantindo integridade de dados, conversão de ODS (11.x -> 13.x), segurança de backup e ajuste automático de strings de conexão.
-
----
-
-## 📋 Características e Funcionalidades
-
-- **Identificação Automática do Sistema:** Reconhece automaticamente os bancos e diretórios dos módulos **AC**, **Ponto**, **AG**, **Patrio**, **Cargas** e **Frota**.
-- **Inspeção de Cabeçalho (ODS):** Lê os bytes do cabeçalho físico da base selecionada para validar se ela já está migrada em ODS 13.x (Firebird 5.0) ou se ainda está em ODS 11.x (Firebird 2.5), prevenindo execuções redundantes.
-- **Validação Preditiva de Disco (2.1x):** Verifica se a partição do banco possui espaço livre equivalente a pelo menos o dobro mais 10% ($2{,}1 \times \text{tamanho}$) do arquivo `.fdb` original antes de iniciar qualquer operação.
-- **Deploy Automático do Firebird 5.0:** Extrai os binários compactados, grava as chaves de registro no Windows (`instreg.exe`) e cria/inicia o serviço do Firebird 5.0 na porta configurada.
-- **Checkpoint / Recuperação de Falhas:** Caso o processo seja interrompido após o backup, o script detecta o `.fbk` temporário e pergunta ao operador se deseja reutilizá-lo, economizando tempo em bases pesadas.
-- **Transição Segura de Serviços:** Remove os serviços antigos do FB 2.5 apenas após a validação do restore no FB 5.0.
-- **Ajuste Automatizado de Conexão (`.ini`):** Atualiza de forma direta as referências de porta (`53052` -> `53055`) em parâmetros como `DatabaseFile`, `DatabaseURL` e `SERVER NAME` nos arquivos de configuração do sistema (`AC.ini`, `Ponto.ini`, etc.), criando backup `.ini_BKP_timestamp` prévio.
+Solução automatizada desenvolvida em PowerShell com interface gráfica nativa em **Windows Forms** para a migração assistida e segura de bases de dados dos sistemas Fortes (**AC, Ponto, AG, Patrio, Cargas e Frota**) do Firebird 2.5 para o Firebird 5.0.
 
 ---
 
-## 🗂 Estrutura de Arquivos
+## 🚀 Principais Funcionalidades
 
-O pacote de migração deve ser distribuído com a seguinte organização de pastas:
+* **Interface Gráfica Intuitiva:** Painel completo em Windows Forms para gestão da fila de migração, dispensando comandos manuais na consola.
+* **Fila Dinâmica com Indicadores Visuais:** Adição e remoção de múltiplas bases na mesma sessão, com mudança de cor e estado por linha em tempo real:
+  * ⚪ **Branco:** Na Fila / Aguardando;
+  * 🟡 **Amarelo:** Em processamento (Extração de Backup / Restauro);
+  * 🟢 **Verde / Negrito:** Concluído com sucesso;
+  * 🔴 **Vermelho:** Erro na operação.
+* **Monitor GBAK em Tempo Real:** Terminal dedicado que exibe o fluxo linha a linha do `gbak -v` (tabelas lidas, índices recriados e metadados) sem congelar a janela principal.
+* **Manutenção da Porta Unificada (53052):** 
+  * Os backups são extraídos via motor do FB 2.5 escutando na porta `53052`.
+  * Os serviços do FB 2.5 são terminados e o FB 5.0 assume a porta `53052` (`firebird.conf`).
+  * As bases são restauradas com tamanho de página otimizado (`-p 8192`) e ODS atualizada (ODS 13.x).
+  * **Zero reconfiguração em terminais:** Os ficheiros de configuração (`.INI`) permanecem intactos.
+* **Validação Prévia de ODS:** Inspeciona o cabeçalho físico da base `.fdb` (offset `0x12`) ao adicionar à lista, alertando o operador se a base já tiver sido migrada anteriormente para FB 5.0.
+* **Regra de Firewall Automatizada:** Garante a abertura de tráfego de entrada para a porta TCP `53052` no Firewall do Windows (`netsh advfirewall`).
+* **Proteção e Preservação de Dados:** Cada base original é preservada no mesmo diretório com sufixo carimbado (`<Sistema>.fdb_OLD_yyyyMMdd_HHmmss`).
+
+---
+
+## 📁 Estrutura de Pastas e Ficheiros
 
 ```text
-MigradorFortes/
+Pasta_Migracao/
 │
-├── ExecutarMigracao.bat         # Wrapper com auto-elevação para Administrador
-├── Migrar-Firebird.ps1          # Script principal com todas as rotinas de migração
-├── README.md                    # Documentação do procedimento
-│
+├── ExecutarMigracao.bat        # Iniciador com elevação UAC automática
+├── Migrar-Firebird-GUI.ps1     # Aplicação principal (PowerShell + WinForms)
+├── README.md                   # Documentação da ferramenta
 └── Binarios/
-    └── Firebird_5_0.zip         # Pacote zipado com os binários do Firebird 5.0 (x64)
+    └── Firebird_5_0.zip        # Pacote com os binários do Firebird 5.0.3
 ```
+
+> **Atenção:** Certifique-se de que o ficheiro `firebird.conf` dentro do pacote `Firebird_5_0.zip` está predefinido para escutar na porta `53052` (`RemoteServicePort = 53052`).
 
 ---
 
-## ⚙️ Parâmetros Técnicos de Execução
+## ⚙️ Mapeamento de Ambientes e Serviços
 
 | Parâmetro | Firebird 2.5 (Origem) | Firebird 5.0 (Destino) |
 | :--- | :--- | :--- |
-| **Diretório Padrão** | `C:\Fortes\Firebird\Firebird_2_5` | `C:\Fortes\Firebird\Firebird_5_0` |
-| **Porta TCP** | `53052` | `53055` |
-| **ODS Suportada** | 11.2 | 13.1 |
-| **Nome do Serviço Server** | `FirebirdServerFortes_FB2_5` | `FirebirdServerFortes_FB5_0` |
-| **Nome do Serviço Guardian** | `FirebirdGuardianFortes_FB2_5` | *(Descontinuado no FB 5.0)* |
+| **Porta de Rede TCP** | `53052` | `53052` *(Porta mantida)* |
+| **Diretório no Servidor** | `C:\Fortes\Firebird\Firebird_2_5` | `C:\Fortes\Firebird\Firebird_5_0` |
+| **Nome do Serviço** | `FirebirdServerFortes_FB2_5` | `FirebirdServerFortes_FB5_0` |
+| **Page Size Padrão** | Original (ex.: 4096) | **8192 bytes** (`-p 8192`) |
+| **Versão da ODS** | ODS 11.2 | ODS 13.1 |
 
 ---
 
-## 🚀 Como Executar
+## 🖥️ Mapeamento dos Sistemas Suportados
 
-1. **Feche os Sistemas:** Certifique-se de que nenhum usuário esteja operando os sistemas Fortes na rede ou localmente no servidor.
-2. **Execute o Inicializador:**
-   - Clique com o botão direito em `ExecutarMigracao.bat` e selecione **Executar como Administrador** (o script também possui elevação automática caso seja aberto por clique duplo).
-3. **Selecione a Base:**
-   - Uma caixa de diálogo do Windows será aberta. Navegue até a pasta do sistema (ex: `C:\Fortes\AC` ou `C:\Fortes\Ponto`) e selecione o banco `.fdb` a ser migrado.
-4. **Acompanhe as Etapas:**
-   - **Etapa 1:** Instalação e inicialização do serviço Firebird 5.0 (Porta 53055).
-   - **Etapa 2:** Validação da ODS, detecção do módulo do sistema e checagem de espaço em disco.
-   - **Etapa 3:** Parada/rearranque de segurança do FB 2.5 e extração do backup via `gbak.exe`.
-   - **Etapa 4:** Restauração do backup na nova arquitetura do FB 5.0.
-   - **Etapa 5:** Desativação e exclusão dos serviços obsoletos do FB 2.5.
-   - **Etapa 6:** Renomeação do banco antigo para `NOME_OLD_DATAHORA` e posicionamento da base final migrada.
-   - **Etapa 7:** Backup e atualização das portas nos arquivos `.ini`.
+A aplicação identifica o módulo automaticamente pelo nome do ficheiro ou pela pasta de origem:
+
+| Sistema | Ficheiro de Dados | Ficheiro .INI | Pasta Padrão Fortes |
+| :--- | :--- | :--- | :--- |
+| **AC** | `AC.fdb` | `AC.ini` *(inalterado)* | `C:\Fortes\AC` |
+| **Ponto** | `Ponto.fdb` | `Ponto.ini` *(inalterado)* | `C:\Fortes\Ponto` |
+| **AG** | `AG.fdb` | `AG.ini` *(inalterado)* | `C:\Fortes\AG` |
+| **Patrio** | `Patrio.fdb` | `Patrio.ini` *(inalterado)* | `C:\Fortes\Patrio` |
+| **Cargas** | `Cargas.fdb` | `Cargas.ini` *(inalterado)* | `C:\Fortes\Cargas` |
+| **Frota** | `Frota.fdb` | `Frota.ini` *(inalterado)* | `C:\Fortes\Frota` |
 
 ---
 
-## 🛡️ Medidas de Segurança e Rollback
+## 📋 Pré-requisitos do Servidor
 
-### O que o script preserva:
-- **Base antiga intacta:** O banco original nunca é sobrescrito diretamente; ele é renomeado para `<NomeDoBanco>.fdb_OLD_yyyyMMdd_HHmmss`.
-- **Arquivos binários do FB 2.5:** A pasta física `C:\Fortes\Firebird\Firebird_2_5` é mantida em disco (apenas o serviço do Windows é removido).
-- **Configuração de conexão:** O arquivo `.ini` recebe um backup com sufixo `_BKP_yyyyMMdd_HHmmss` antes de qualquer alteração de linha.
+1. **Sistema Operativo:** Windows Server 2012 R2 ou superior / Windows 10 ou 11 (64-bit).
+2. **Ambiente de Execução:** Pacote `Visual C++ 2015-2022 Redistributable (x64)` instalado.
+3. **Privilégios:** Acesso de Administrador local da máquina.
+4. **Espaço em Disco:** Mínimo de 2,1x o tamanho da base de dados na partição em que os ficheiros estão localizados.
 
-### Como desfazer (Rollback de emergência):
-Caso precise reverter para o Firebird 2.5 imediatamente:
-1. Reinstale os serviços do FB 2.5 executando em um prompt de Administrador:
+---
+
+## 🛠️ Passo a Passo Operacional
+
+1. Certifique-se de que todos os colaboradores fecharam os sistemas Fortes nas estações e no servidor.
+2. Extraia o pacote de migração numa diretoria local do servidor (ex.: `C:\MigradorFortes`).
+3. Execute o ficheiro **`ExecutarMigracao.bat`** (aceite o aviso de privilégios de Administrador).
+4. Na interface gráfica:
+   * Clique em **`Adicionar...`** e selecione o ficheiro `.fdb` do primeiro sistema.
+   * Repita a seleção para os restantes sistemas que residem no servidor (ex.: AC, Ponto, Frota).
+   * Caso adicione alguma base por engano, selecione a linha e clique em **`Remover`**.
+5. Clique no botão verde **`INICIAR`** e confirme a mensagem de arranque.
+6. Acompanhe a execução:
+   * A coluna **Status** indicará o progresso de cada banco individualmente.
+   * O painel **Acompanhamento do GBAK** apresentará o fluxo contínuo das tabelas e índices processados.
+   * O painel **Log Geral** indicará o registo do serviço, regras de firewall e transições de pastas.
+7. Quando surgir a mensagem de confirmação de conclusão com sucesso, as bases estarão prontas a ser utilizadas diretamente pelos terminais.
+
+---
+
+## 🔄 Procedimento de Contingência (Rollback)
+
+Se for necessário desfazer a operação por qualquer anomalia antes da validação final:
+
+1. **Restaurar as Bases de Dados Originais:**
+   Aceda à pasta onde reside a base e elimine a base migrada recente. Localize o ficheiro de salvaguarda `<Sistema>.fdb_OLD_yyyyMMdd_HHmmss` e retire o sufixo, restabelecendo o nome original (ex.: `AC.fdb`).
+2. **Reativar o Serviço do Firebird 2.5 na Porta 53052:**
+   Abra uma Linha de Comandos (como Administrador) e execute:
    ```cmd
-   C:\Fortes\Firebird\Firebird_2_5\bin\instreg.exe install "C:\Fortes\Firebird\Firebird_2_5"
-   C:\Fortes\Firebird\Firebird_2_5\bin\instsvc.exe install -auto -name Fortes_FB2_5
-   C:\Fortes\Firebird\Firebird_2_5\bin\instsvc.exe start -name Fortes_FB2_5
+   net stop FirebirdServerFortes_FB5_0
+   sc config FirebirdServerFortes_FB5_0 start= demand
+   "C:\Fortes\Firebird\Firebird_2_5\bin\instreg.exe" install "C:\Fortes\Firebird\Firebird_2_5"
+   "C:\Fortes\Firebird\Firebird_2_5\bin\instsvc.exe" install -auto -name Fortes_FB2_5
+   "C:\Fortes\Firebird\Firebird_2_5\bin\instsvc.exe" start -name Fortes_FB2_5
    ```
-2. Renomeie o arquivo `.fdb` migrado para outro nome e retorne o arquivo `_OLD_...` para o nome original (`AC.fdb`, etc.).
-3. Restaure o arquivo `.ini` a partir do backup `_BKP_...`.
-
----
-
-## 📌 Requisitos Mínimos do Sistema
-
-- **Sistemas Operacionais Homologados:** Windows Server 2012 / 2012 R2 / 2016 / 2019 / 2022, Windows 10 e Windows 11 (64-bit).
-- **Permissões:** Privilégios de Administrador local.
-- **Dependências de Runtime:** Pacote `Microsoft Visual C++ 2015-2022 Redistributable (x64)` instalado na máquina host.
