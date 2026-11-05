@@ -1,7 +1,9 @@
 ﻿<#
 .SYNOPSIS
-    Migrador Firebird 2.5 para 5.0 (Fortes Tecnologia) - UI Sem Travamentos
+    Migrador Firebird 2.5 para 5.0 (Fortes Tecnologia) - UI Completa e Fluida
     Sistemas suportados: AC, Ponto, AG, Patrio, Cargas e Frota.
+    Desenvolvido por: Pedro Mesquita (pedromesquita@fortestecnologia.com.br)
+    Auxílio de IA: Arquitetura e rotinas auxiliadas por Google Gemini.
 #>
 
 [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
@@ -16,7 +18,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # --- CONFIGURAÇÃO DA JANELA PRINCIPAL ---
 $Form = New-Object System.Windows.Forms.Form
 $Form.Text = "Migrador Firebird 2.5 -> 5.0 (Fortes Tecnologia)"
-$Form.Size = New-Object System.Drawing.Size(820, 750)
+$Form.Size = New-Object System.Drawing.Size(820, 765)
 $Form.StartPosition = "CenterScreen"
 $Form.FormBorderStyle = "FixedDialog"
 $Form.MaximizeBox = $false
@@ -121,6 +123,16 @@ $TxtLogs.ForeColor = [System.Drawing.Color]::LightGray
 $TxtLogs.Font = $FontGbak
 $GrpLogs.Controls.Add($TxtLogs)
 
+# 5. Rodapé: Créditos do Desenvolvedor
+$LblCreditos = New-Object System.Windows.Forms.Label
+$LblCreditos.Text = "Desenvolvido por Pedro Mesquita (pedromesquita@fortestecnologia.com.br)"
+$LblCreditos.Location = New-Object System.Drawing.Point(15, 702)
+$LblCreditos.Size = New-Object System.Drawing.Size(775, 18)
+$LblCreditos.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+$LblCreditos.ForeColor = [System.Drawing.Color]::Gray
+$LblCreditos.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
+$Form.Controls.Add($LblCreditos)
+
 # --- ESTRUTURA SINCRONIZADA ---
 $SyncHash = [hashtable]::Synchronized(@{
     StatusText    = ""
@@ -170,7 +182,6 @@ $TimerAtualizacao.Add_Tick({
             [System.Threading.Monitor]::Exit($SyncHash.GbakQueue.SyncRoot)
         }
         if ($gbakParaEscrever.Count -gt 0) {
-            # Evita sobrecarga de texto infinito mantendo os últimos 30.000 caracteres
             if ($TxtGbak.TextLength -gt 30000) {
                 $TxtGbak.Text = $TxtGbak.Text.Substring($TxtGbak.TextLength - 15000)
             }
@@ -214,7 +225,6 @@ $TimerAtualizacao.Add_Tick({
         }
     }
 
-    # Mantém a janela respondendo ao sistema operacional
     [System.Windows.Forms.Application]::DoEvents()
 
     if ($SyncHash.Concluido) {
@@ -513,7 +523,7 @@ $BtnIniciar.Add_Click({
                 Move-Item -Path $item.ArquivoBancoNovo -Destination $item.ArquivoBancoFinal -Force
                 Log "Base $($item.Sistema) disponível em: $($item.ArquivoBancoFinal)"
 
-                # Linha finalizada: status muda e fica verde na interface
+                # SINALIZAÇÃO VISUAL: Base finalizada com destaque em verde
                 $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Concluído [OK]"; Tipo = "Concluido" }) | Out-Null
                 $Sync.Progress++
             }
