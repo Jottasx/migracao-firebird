@@ -1,12 +1,17 @@
 ﻿<#
 .SYNOPSIS
-    Migrador Firebird 2.5 para 5.0 (Fortes Tecnologia) - Multi-Sistemas
+    Migrador Firebird 2.5 para 5.0 (Fortes Tecnologia) - Porta Unificada 53052
     Sistemas suportados: AC, Ponto, AG, Patrio, Cargas e Frota.
-    Fluxo: Loop de migracao de multiplos bancos com desinstalacao do FB 2.5
-           apenas apos confirmacao de que todos os sistemas foram concluidos.
+    Fluxo:
+      1. Deploy e registro do servico do FB 5.0 (configurado para a porta 53052 no firebird.conf).
+      2. Loop de selecao de bases e geracao de backups via FB 2.5 (porta 53052).
+      3. Parada definitiva do FB 2.5 para liberar a porta 53052.
+      4. Subida do servico do FB 5.0 na porta 53052.
+      5. Restauracao dos bancos via FB 5.0 diretamente na porta 53052.
+      6. Arquivos .ini permanecem intactos, mantendo comunicacao ativa com os terminais.
 #>
 
-# Forca o console a operar em UTF-8
+# Forca o console a utilizar UTF-8
 [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding           = [System.Text.Encoding]::UTF8
@@ -15,7 +20,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # ==========================================
-# 1. PARAMETROS E CAMINHOS GERAIS
+# 1. PARAMETROS E CAMINHOS
 # ==========================================
 $PastaDestinoFB50     = "C:\Fortes\Firebird\Firebird_5_0"
 $ZipOrigemFB50        = Join-Path $ScriptDir "Binarios\Firebird_5_0.zip"
@@ -26,8 +31,8 @@ $CaminhoFB50_Gbak     = Join-Path $PastaDestinoFB50 "gbak.exe"
 $CaminhoFB50_InstSvc  = Join-Path $PastaDestinoFB50 "instsvc.exe"
 $CaminhoFB50_InstReg  = Join-Path $PastaDestinoFB50 "instreg.exe"
 
-$PortaFB25 = "53052"
-$PortaFB50 = "53055"
+# Porta unificada para manter compatibilidade com os terminais
+$PortaPadrao = "53052"
 
 $UsuarioFB = "SYSDBA"
 $SenhaFB   = "masterkey"
@@ -38,14 +43,14 @@ $ServicoFB25_Guardian = "FirebirdGuardianFortes_FB2_5"
 $NomeInstanciaFB50    = "Fortes_FB5_0"
 $ServicoFB50_Server   = "FirebirdServer$NomeInstanciaFB50"
 
-# Lista para registrar os bancos migrados com sucesso na sessao
-$BancosMigradosComSucesso = [System.Collections.Generic.List[string]]::new()
+# Estrutura para armazenar a fila de migracao
+$FilaDeBancos = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 # ==========================================
-# 2. ETAPA 1: DEPLOY E SERVICO DO FIREBIRD 5.0
+# 2. ETAPA 1: VERIFICACAO / PREPARACAO DO FB 5.0
 # ==========================================
 Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host "ETAPA 1: Verificacao do Firebird 5.0" -ForegroundColor Cyan
+Write-Host "ETAPA 1: Preparacao do Firebird 5.0" -ForegroundColor Cyan
 Write-Host "==========================================" -ForegroundColor Cyan
 
 if (-not (Test-Path $CaminhoFB25_Gbak)) {
@@ -53,6 +58,7 @@ if (-not (Test-Path $CaminhoFB25_Gbak)) {
     exit 1
 }
 
+# Se o gbak do 5.0 nao existir, extrai o ZIP dos binarios
 if (-not (Test-Path $CaminhoFB50_Gbak)) {
     if (-not (Test-Path $ZipOrigemFB50)) {
         Write-Error "Arquivo ZIP de instalacao nao encontrado em: $ZipOrigemFB50"
@@ -68,10 +74,12 @@ if (-not (Test-Path $CaminhoFB50_Gbak)) {
     Write-Host "Arquivos descompactados com sucesso!" -ForegroundColor Green
 }
 
+# Garante a chave de registro do FB 5.0
 if (Test-Path $CaminhoFB50_InstReg) {
     & $CaminhoFB50_InstReg install "$PastaDestinoFB50" 2>$null | Out-Null
 }
 
+# Registra o servico do FB 5.0 (sem iniciar ainda para nao colidir na porta 53052)
 $ServicoFB50 = Get-Service -Name $ServicoFB50_Server -ErrorAction SilentlyContinue
 
 if (-not $ServicoFB50) {
@@ -79,99 +87,74 @@ if (-not $ServicoFB50) {
     if (Test-Path $CaminhoFB50_InstSvc) {
         & $CaminhoFB50_InstSvc install -auto -name $NomeInstanciaFB50
         Start-Sleep -Seconds 2
-        $ServicoFB50 = Get-Service -Name $ServicoFB50_Server -ErrorAction SilentlyContinue
     } else {
         Write-Error "instsvc.exe nao encontrado para registrar o servico."
         exit 1
     }
 }
 
-if ($ServicoFB50.Status -ne "Running") {
-    Write-Host "Iniciando servico $ServicoFB50_Server..." -ForegroundColor Yellow
-    Start-Service -Name $ServicoFB50_Server
-    Start-Sleep -Seconds 3
-}
-
-Write-Host "[OK] Firebird 5.0 ativo e operacional na porta $PortaFB50." -ForegroundColor Green
-
 # Liberacao da porta no Firewall
-Write-Host "Configurando regra de entrada no Firewall do Windows..." -ForegroundColor Yellow
-$NomeRegra = "Firebird 5.0 - Fortes (Porta $PortaFB50)"
+Write-Host "Verificando regra de Firewall para a porta $PortaPadrao..." -ForegroundColor Yellow
+$NomeRegra = "Firebird Fortes (Porta $PortaPadrao)"
 netsh advfirewall firewall delete rule name="$NomeRegra" >$null 2>&1
-netsh advfirewall firewall add rule name="$NomeRegra" dir=in action=allow protocol=TCP localport=$PortaFB50 profile=any >$null
+netsh advfirewall firewall add rule name="$NomeRegra" dir=in action=allow protocol=TCP localport=$PortaPadrao profile=any >$null
 
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "[OK] Porta $PortaFB50 liberada no Firewall do Windows." -ForegroundColor Green
-} else {
-    Write-Host "[AVISO] Nao foi possivel configurar o Firewall automaticamente." -ForegroundColor Yellow
-}
+Write-Host "[OK] Firewall validado para a porta $PortaPadrao." -ForegroundColor Green
 
 # ==========================================
-# 3. LOOP DE MIGRACAO DE SISTEMAS
+# 3. ETAPA 2: FILA DE BASES PARA MIGRAR
 # ==========================================
 Add-Type -AssemblyName System.Windows.Forms
 
-$ContinuarMigrandoOutro = $true
-$ContadorSistemas = 0
+$ColetandoBancos = $true
+$Contador = 0
 
-while ($ContinuarMigrandoOutro) {
-    $ContadorSistemas++
+while ($ColetandoBancos) {
+    $Contador++
 
     Write-Host "`n==========================================" -ForegroundColor Cyan
-    Write-Host "SELECAO DO SISTEMA / BANCO (MIGRACAO #$ContadorSistemas)" -ForegroundColor Cyan
+    Write-Host "SELECAO DO SISTEMA / BANCO (BASE #$Contador)" -ForegroundColor Cyan
     Write-Host "==========================================" -ForegroundColor Cyan
 
     $OpenFileDialog = New-Object System.Windows.Forms.OpenFileDialog
-    $OpenFileDialog.Title = "Selecione a base Firebird (.FDB) do sistema para migrar"
+    $OpenFileDialog.Title = "Selecione o arquivo .FDB do sistema para migrar"
     $OpenFileDialog.InitialDirectory = "C:\Fortes"
     $OpenFileDialog.Filter = "Banco Firebird (*.fdb)|*.fdb|Todos os Arquivos (*.*)|*.*"
 
     if ($OpenFileDialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
-        Write-Host "Selecao cancelada pelo operador." -ForegroundColor Yellow
-        if ($BancosMigradosComSucesso.Count -gt 0) {
-            # Se já migrou pelo menos um banco antes, apenas encerra o loop para seguir para a limpeza
-            break
-        } else {
-            exit 0
-        }
+        Write-Host "Selecao finalizada/cancelada pelo operador." -ForegroundColor Yellow
+        break
     }
 
     $BancoOrigem = $OpenFileDialog.FileName
     $DiretorioDados = [System.IO.Path]::GetDirectoryName($BancoOrigem)
     $NomeArquivoOrigem = [System.IO.Path]::GetFileNameWithoutExtension($BancoOrigem)
-    $CaminhoCompletoMinusculo = $BancoOrigem.ToLower()
+    $CaminhoMinusculo = $BancoOrigem.ToLower()
 
-    # Identificacao do sistema correspondente
-    if ($NomeArquivoOrigem -like "*Ponto*" -or $CaminhoCompletoMinusculo -match "\\ponto\\") {
-        $SistemaDetectado = "Ponto"
-    } elseif ($NomeArquivoOrigem -like "*Patrio*" -or $CaminhoCompletoMinusculo -match "\\patrio\\") {
-        $SistemaDetectado = "Patrio"
-    } elseif ($NomeArquivoOrigem -like "*Cargas*" -or $CaminhoCompletoMinusculo -match "\\cargas\\") {
-        $SistemaDetectado = "Cargas"
-    } elseif ($NomeArquivoOrigem -like "*Frota*" -or $CaminhoCompletoMinusculo -match "\\frota\\") {
-        $SistemaDetectado = "Frota"
-    } elseif ($NomeArquivoOrigem -match "(^|_)AG($|_)" -or $CaminhoCompletoMinusculo -match "\\ag\\") {
-        $SistemaDetectado = "AG"
+    # Deteccao de modulo
+    if ($NomeArquivoOrigem -like "*Ponto*" -or $CaminhoMinusculo -match "\\ponto\\") {
+        $Sistema = "Ponto"
+    } elseif ($NomeArquivoOrigem -like "*Patrio*" -or $CaminhoMinusculo -match "\\patrio\\") {
+        $Sistema = "Patrio"
+    } elseif ($NomeArquivoOrigem -like "*Cargas*" -or $CaminhoMinusculo -match "\\cargas\\") {
+        $Sistema = "Cargas"
+    } elseif ($NomeArquivoOrigem -like "*Frota*" -or $CaminhoMinusculo -match "\\frota\\") {
+        $Sistema = "Frota"
+    } elseif ($NomeArquivoOrigem -match "(^|_)AG($|_)" -or $CaminhoMinusculo -match "\\ag\\") {
+        $Sistema = "AG"
     } else {
-        $SistemaDetectado = "AC"
+        $Sistema = "AC"
     }
 
-    $NomeFinalBanco    = "$SistemaDetectado.fdb"
-    $NomeArquivoIni    = "$SistemaDetectado.ini"
-    $PastaPadraoFortes = "C:\Fortes\$SistemaDetectado"
-
-    $ArquivoBackupTemp = Join-Path $DiretorioDados "temp_migracao.fbk"
-    $ArquivoBancoNovo  = Join-Path $DiretorioDados "temp_fb50.fdb"
+    $NomeFinalBanco    = "$Sistema.fdb"
+    $ArquivoBackupTemp = Join-Path $DiretorioDados "temp_migracao_$Sistema.fbk"
+    $ArquivoBancoNovo  = Join-Path $DiretorioDados "temp_fb50_$Sistema.fdb"
     $ArquivoBancoFinal = Join-Path $DiretorioDados $NomeFinalBanco
 
-    Write-Host "Sistema Detectado: $SistemaDetectado" -ForegroundColor Green
-    Write-Host "Banco Origem:      $BancoOrigem"
-    Write-Host "Destino Final:     $ArquivoBancoFinal" -ForegroundColor Yellow
+    Write-Host "Sistema Detectado: $Sistema" -ForegroundColor Green
+    Write-Host "Caminho da Base:   $BancoOrigem"
 
-    # --- VERIFICACAO DA ODS DO BANCO (CABECALHO) ---
-    Write-Host "`n--- Verificando versao interna da base (ODS) ---" -ForegroundColor Cyan
-    $PularEstaBase = $false
-
+    # Verificacao ODS
     try {
         $Stream = [System.IO.File]::OpenRead($BancoOrigem)
         $Buffer = New-Object byte[] 32
@@ -181,199 +164,175 @@ while ($ContinuarMigrandoOutro) {
         $ODS_Major = [int]$Buffer[18]
         $ODS_Minor = [int]$Buffer[20]
 
-        Write-Host "ODS detectada no cabecalho: $ODS_Major.$ODS_Minor" -ForegroundColor DarkGray
-
         if ($ODS_Major -ge 13) {
-            Write-Host "`n[AVISO] Esta base de dados JA ESTA MIGRADA para o Firebird 5.0 (ODS $ODS_Major.$ODS_Minor)!" -ForegroundColor Green
-            $Forcar = Read-Host "Deseja forcar a migracao deste banco novamente (S/N)?"
+            Write-Host "`n[AVISO] Base ja migrada para o FB 5.0 (ODS $ODS_Major.$ODS_Minor)!" -ForegroundColor Green
+            $Forcar = Read-Host "Deseja incluir essa base mesmo assim (S/N)?"
             if ($Forcar -notmatch "^[sS]") {
-                Write-Host "Pulando base $SistemaDetectado..." -ForegroundColor Yellow
-                $PularEstaBase = $true
+                $PerguntaOutro = Read-Host "`nDeseja selecionar OUTRO sistema (S/N)?"
+                $ColetandoBancos = ($PerguntaOutro -match "^[sS]")
+                continue
             }
-        } elseif ($ODS_Major -eq 11) {
-            Write-Host "[OK] Base identificada no formato Firebird 2.5 (ODS 11.x)." -ForegroundColor Green
         }
     } catch {
-        Write-Host "Nao foi possivel ler os bytes de cabecalho, prosseguindo com a migracao..." -ForegroundColor DarkGray
+        Write-Host "Nao foi possivel inspecionar os bytes do cabecalho, prosseguindo..." -ForegroundColor DarkGray
     }
 
-    if ($PularEstaBase) {
-        $PerguntaContinuar = Read-Host "`nDeseja migrar OUTRO sistema/banco agora (S/N)?"
-        $ContinuarMigrandoOutro = ($PerguntaContinuar -match "^[sS]")
-        continue
-    }
-
-    # --- VALIDACAO DE ESPACO EM DISCO (2.1x) ---
-    $TamanhoBancoBytes = (Get-Item $BancoOrigem).Length
-    $EspacoNecessarioBytes = [math]::Round($TamanhoBancoBytes * 2.1)
-
-    $TamanhoBancoGB     = [math]::Round($TamanhoBancoBytes / 1GB, 2)
-    $EspacoNecessarioGB = [math]::Round($EspacoNecessarioBytes / 1GB, 2)
-
+    # Validacao de espaco em disco (2.1x)
+    $TamanhoBytes = (Get-Item $BancoOrigem).Length
+    $EspacoNecessarioBytes = [math]::Round($TamanhoBytes * 2.1)
     $LetraUnidade = [System.IO.Path]::GetPathRoot($BancoOrigem).Replace("\", "")
     $UnidadeDisco = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object { $_.DeviceID -eq $LetraUnidade }
 
-    if ($UnidadeDisco) {
-        $EspacoLivreBytes = $UnidadeDisco.FreeSpace
-        $EspacoLivreGB    = [math]::Round($EspacoLivreBytes / 1GB, 2)
-
-        Write-Host "`n--- Validacao de Disco ($LetraUnidade) ---" -ForegroundColor Cyan
-        Write-Host "Tamanho do Banco Atual:   $TamanhoBancoGB GB"
-        Write-Host "Espaco Minimo Solicitado: $EspacoNecessarioGB GB (2.1x)"
-        Write-Host "Espaco Livre Disponivel:  $EspacoLivreGB GB"
-
-        if ($EspacoLivreBytes -lt $EspacoNecessarioBytes) {
-            Write-Host "`n[ERRO CRITICO] Espaco insuficiente no disco $LetraUnidade!" -ForegroundColor Red
-            Write-Host "Sao necessarios pelo menos $EspacoNecessarioGB GB livres." -ForegroundColor Red
-            
-            $PerguntaContinuar = Read-Host "`nDeseja tentar outro sistema em outra unidade (S/N)?"
-            $ContinuarMigrandoOutro = ($PerguntaContinuar -match "^[sS]")
-            continue
-        } else {
-            Write-Host "[OK] Espaco em disco suficiente." -ForegroundColor Green
-        }
+    if ($UnidadeDisco -and ($UnidadeDisco.FreeSpace -lt $EspacoNecessarioBytes)) {
+        Write-Host "[ERRO CRITICO] Espaco insuficiente no disco $LetraUnidade!" -ForegroundColor Red
+        Write-Host "Necessarios: $([math]::Round($EspacoNecessarioBytes / 1GB, 2)) GB | Livres: $([math]::Round($UnidadeDisco.FreeSpace / 1GB, 2)) GB" -ForegroundColor Red
+        $PerguntaOutro = Read-Host "`nDeseja tentar outro sistema (S/N)?"
+        $ColetandoBancos = ($PerguntaOutro -match "^[sS]")
+        continue
     }
 
-    # --- BACKUP VIA FIREBIRD 2.5 ---
-    Write-Host "`n--- Iniciando Backup (FB 2.5) ---" -ForegroundColor Cyan
-    $PularBackup = $false
+    # Adiciona a fila de trabalho
+    $FilaDeBancos.Add([PSCustomObject]@{
+        Sistema           = $Sistema
+        BancoOrigem       = $BancoOrigem
+        ArquivoBackupTemp = $ArquivoBackupTemp
+        ArquivoBancoNovo  = $ArquivoBancoNovo
+        ArquivoBancoFinal = $ArquivoBancoFinal
+    })
 
-    if (Test-Path $ArquivoBackupTemp) {
-        $TamanhoMB = [math]::Round(((Get-Item $ArquivoBackupTemp).Length / 1MB), 2)
-        $DataBkp   = (Get-Item $ArquivoBackupTemp).LastWriteTime.ToString("dd/MM/yyyy HH:mm:ss")
-        
-        Write-Host "[CHECKPOINT] Arquivo de backup anterior localizado: $ArquivoBackupTemp ($TamanhoMB MB - $DataBkp)" -ForegroundColor Yellow
-        $Escolha = Read-Host "Deseja APROVEITAR este backup existente (S/N)?"
+    Write-Host "[OK] Base adicionada a fila de migracao." -ForegroundColor Green
+
+    $PerguntaOutro = Read-Host "`nDeseja adicionar MAIS UM sistema a fila (ex: Ponto, Patrio, AG, Frota) (S/N)?"
+    $ColetandoBancos = ($PerguntaOutro -match "^[sS]")
+}
+
+if ($FilaDeBancos.Count -eq 0) {
+    Write-Host "`nNenhuma base foi selecionada para migracao. Finalizando operacao..." -ForegroundColor Yellow
+    exit 0
+}
+
+# ==========================================
+# 4. ETAPA 3: GERAR BACKUPS (FB 2.5 - PORTA 53052)
+# ==========================================
+Write-Host "`n==========================================" -ForegroundColor Cyan
+Write-Host "ETAPA 3: Extraindo Backups via Firebird 2.5" -ForegroundColor Cyan
+Write-Host "==========================================" -ForegroundColor Cyan
+
+# Garante que o servico 2.5 esta ativo para fazer a extracao
+Write-Host "Reiniciando Firebird 2.5 para liberar conexoes presas..." -ForegroundColor Yellow
+if (Get-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue) {
+    Stop-Service -Name $ServicoFB25_Guardian -Force -ErrorAction SilentlyContinue
+}
+if (Get-Service -Name $ServicoFB25_Server -ErrorAction SilentlyContinue) {
+    Restart-Service -Name $ServicoFB25_Server -Force
+}
+if (Get-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue) {
+    Start-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue
+}
+
+foreach ($item in $FilaDeBancos) {
+    Write-Host "`nExtraindo backup do sistema: $($item.Sistema)..." -ForegroundColor Yellow
+    
+    $PularBackup = $false
+    if (Test-Path $item.ArquivoBackupTemp) {
+        $TamanhoMB = [math]::Round(((Get-Item $item.ArquivoBackupTemp).Length / 1MB), 2)
+        Write-Host "[CHECKPOINT] Backup encontrado: $($item.ArquivoBackupTemp) ($TamanhoMB MB)" -ForegroundColor Yellow
+        $Escolha = Read-Host "Deseja APROVEITAR esse backup ja existente (S/N)?"
         if ($Escolha -match "^[sS]") {
             $PularBackup = $true
         } else {
-            Remove-Item $ArquivoBackupTemp -Force
+            Remove-Item $item.ArquivoBackupTemp -Force
         }
     }
 
     if (-not $PularBackup) {
-        # Reinicia o FB 2.5 para fechar sessoes orfas nesta base
-        if (Get-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue) {
-            Stop-Service -Name $ServicoFB25_Guardian -Force -ErrorAction SilentlyContinue
+        $ConexaoFB25 = "localhost/${PortaPadrao}:$($item.BancoOrigem)"
+        & $CaminhoFB25_Gbak -b -v -g "$ConexaoFB25" "$($item.ArquivoBackupTemp)" -user $UsuarioFB -password $SenhaFB
+
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $item.ArquivoBackupTemp)) {
+            Write-Error "Falha ao extrair backup do sistema $($item.Sistema)."
+            exit 1
         }
-        if (Get-Service -Name $ServicoFB25_Server -ErrorAction SilentlyContinue) {
-            Restart-Service -Name $ServicoFB25_Server -Force
-        }
-        if (Get-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue) {
-            Start-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue
-        }
-
-        $ConexaoFB25 = "localhost/${PortaFB25}:${BancoOrigem}"
-        Write-Host "Extraindo base via gbak do Firebird 2.5..." -ForegroundColor Yellow
-        & $CaminhoFB25_Gbak -b -v -g "$ConexaoFB25" "$ArquivoBackupTemp" -user $UsuarioFB -password $SenhaFB
-
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ArquivoBackupTemp)) {
-            Write-Error "Falha ao gerar backup no Firebird 2.5 para a base $BancoOrigem."
-            continue
-        }
-        Write-Host "[OK] Backup gerado com sucesso." -ForegroundColor Green
+        Write-Host "[OK] Backup do $($item.Sistema) finalizado com sucesso." -ForegroundColor Green
     }
-
-    # --- RESTORE NO FIREBIRD 5.0 ---
-    Write-Host "`n--- Restaurando Base no Firebird 5.0 ---" -ForegroundColor Cyan
-    if (Test-Path $ArquivoBancoNovo) {
-        Remove-Item $ArquivoBancoNovo -Force
-    }
-
-    $ConexaoFB50 = "localhost/${PortaFB50}:${ArquivoBancoNovo}"
-    Write-Host "Restaurando base no formato FB 5.0 (Porta $PortaFB50)..." -ForegroundColor Yellow
-    & $CaminhoFB50_Gbak -c -v "$ArquivoBackupTemp" "$ConexaoFB50" -user $UsuarioFB -password $SenhaFB
-
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ArquivoBancoNovo)) {
-        Write-Error "Falha ao restaurar banco no Firebird 5.0."
-        continue
-    }
-    Write-Host "[OK] Restauracao concluida com exito." -ForegroundColor Green
-
-    # Limpeza do temporario de backup
-    if (Test-Path $ArquivoBackupTemp) {
-        Remove-Item $ArquivoBackupTemp -Force
-    }
-
-    # Renomeia banco legado caso exista o arquivo de destino padrao
-    if (Test-Path $ArquivoBancoFinal) {
-        $DataHora = Get-Date -Format "yyyyMMdd_HHmmss"
-        $BackupAntigo = "${ArquivoBancoFinal}_OLD_${DataHora}"
-        Write-Host "Preservando base anterior em: $BackupAntigo" -ForegroundColor Yellow
-        Rename-Item -Path $ArquivoBancoFinal -NewName (Split-Path $BackupAntigo -Leaf) -Force
-    }
-
-    Move-Item -Path $ArquivoBancoNovo -Destination $ArquivoBancoFinal -Force
-    Write-Host "[OK] Base oficial do sistema pronta em: $ArquivoBancoFinal" -ForegroundColor Green
-
-    # --- ATUALIZACAO DO ARQUIVO .INI ---
-    Write-Host "`n--- Atualizando arquivo de configuracao (.INI) ---" -ForegroundColor Cyan
-    $CaminhoIni = Join-Path $DiretorioDados $NomeArquivoIni
-    if (-not (Test-Path $CaminhoIni)) {
-        $CaminhoIni = Join-Path $PastaPadraoFortes $NomeArquivoIni
-    }
-
-    if (Test-Path $CaminhoIni) {
-        $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $BackupIni = "${CaminhoIni}_BKP_${Timestamp}"
-        Copy-Item -Path $CaminhoIni -Destination $BackupIni -Force
-        Write-Host "Backup do .ini salvo em: $BackupIni"
-
-        $ConteudoIni = Get-Content -Path $CaminhoIni -Raw -Encoding Default
-        $NovoConteudoIni = $ConteudoIni.Replace('/53052:', '/53055:').Replace(':53052:', ':53055:').Replace('$153055:', '/53055:')
-
-        [System.IO.File]::WriteAllText($CaminhoIni, $NovoConteudoIni, [System.Text.Encoding]::Default)
-        Write-Host "[OK] Portas atualizadas para 53055 no arquivo $NomeArquivoIni!" -ForegroundColor Green
-    } else {
-        Write-Host "[AVISO] Arquivo $NomeArquivoIni nao foi encontrado. Atualize as portas manualmente se necessario." -ForegroundColor Yellow
-    }
-
-    $BancosMigradosComSucesso.Add("$SistemaDetectado ($ArquivoBancoFinal)")
-    Write-Host "`n>>> Sistema $SistemaDetectado MIGRADO COM SUCESSO! <<<" -ForegroundColor Green
-
-    # Pergunta antes de seguir
-    $PerguntaOutro = Read-Host "`nDeseja migrar OUTRO sistema da Fortes agora (ex: Ponto, Patrio, AG, etc) (S/N)?"
-    $ContinuarMigrandoOutro = ($PerguntaOutro -match "^[sS]")
 }
 
 # ==========================================
-# 4. FINALIZACAO E DESATIVACAO DO FB 2.5
+# 5. ETAPA 4: VIRADA DE CHAVE DOS SERVICOS
 # ==========================================
 Write-Host "`n==========================================" -ForegroundColor Cyan
-Write-Host "FINALIZACAO: Remocao dos Servicos Antigos" -ForegroundColor Cyan
+Write-Host "ETAPA 4: Transicao de Motores na Porta $PortaPadrao" -ForegroundColor Cyan
 Write-Host "==========================================" -ForegroundColor Cyan
 
-if ($BancosMigradosComSucesso.Count -gt 0) {
-    Write-Host "Todos os sistemas selecionados foram migrados com sucesso." -ForegroundColor Green
-    
-    $ConfirmarDesativacao = Read-Host "`nTem certeza de que TODOS os sistemas Fortes deste servidor ja estao no FB 5.0 e deseja DESATIVAR o Firebird 2.5 (S/N)?"
-    if ($ConfirmarDesativacao -match "^[sS]") {
-        Write-Host "Desativando servicos do Firebird 2.5..." -ForegroundColor Yellow
-        Stop-Service -Name $ServicoFB25_Guardian -Force -ErrorAction SilentlyContinue
-        Stop-Service -Name $ServicoFB25_Server -Force -ErrorAction SilentlyContinue
+Write-Host "Parando e desinstalando servicos do Firebird 2.5..." -ForegroundColor Yellow
+Stop-Service -Name $ServicoFB25_Guardian -Force -ErrorAction SilentlyContinue
+Stop-Service -Name $ServicoFB25_Server -Force -ErrorAction SilentlyContinue
 
-        sc.exe delete $ServicoFB25_Guardian | Out-Null
-        sc.exe delete $ServicoFB25_Server | Out-Null
-        Write-Host "[OK] Servicos do Firebird 2.5 desativados e removidos com sucesso!" -ForegroundColor Green
-    } else {
-        Write-Host "[AVISO] Os servicos do Firebird 2.5 NAO foram removidos e continuam operacionais para os demais sistemas legados." -ForegroundColor Yellow
+sc.exe delete $ServicoFB25_Guardian | Out-Null
+sc.exe delete $ServicoFB25_Server | Out-Null
+Start-Sleep -Seconds 2
+
+Write-Host "Iniciando o Firebird 5.0 na porta unificada $PortaPadrao..." -ForegroundColor Yellow
+Start-Service -Name $ServicoFB50_Server
+Start-Sleep -Seconds 3
+
+# Valida se subiu
+$StatusFB50 = (Get-Service -Name $ServicoFB50_Server).Status
+if ($StatusFB50 -ne "Running") {
+    Write-Error "O Firebird 5.0 nao conseguiu iniciar. Verifique se o firebird.conf esta configurado com a porta $PortaPadrao."
+    exit 1
+}
+Write-Host "[OK] Firebird 5.0 ativo e escutando na porta $PortaPadrao!" -ForegroundColor Green
+
+# ==========================================
+# 6. ETAPA 5: RESTAURAR BASES NO FB 5.0
+# ==========================================
+Write-Host "`n==========================================" -ForegroundColor Cyan
+Write-Host "ETAPA 5: Restaurando Bases no Firebird 5.0" -ForegroundColor Cyan
+Write-Host "==========================================" -ForegroundColor Cyan
+
+foreach ($item in $FilaDeBancos) {
+    Write-Host "`nRestaurando sistema: $($item.Sistema)..." -ForegroundColor Yellow
+
+    if (Test-Path $item.ArquivoBancoNovo) {
+        Remove-Item $item.ArquivoBancoNovo -Force
     }
-} else {
-    Write-Host "Nenhum banco foi migrado nesta execucao. Os servicos do FB 2.5 foram mantidos intactos." -ForegroundColor Yellow
+
+    $ConexaoFB50 = "localhost/${PortaPadrao}:$($item.ArquivoBancoNovo)"
+    & $CaminhoFB50_Gbak -c -v -p 8192 "$($item.ArquivoBackupTemp)" "$ConexaoFB50" -user $UsuarioFB -password $SenhaFB
+
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $item.ArquivoBancoNovo)) {
+        Write-Error "Falha ao restaurar banco $($item.Sistema) no Firebird 5.0."
+        exit 1
+    }
+
+    # Limpa arquivo temporario de backup
+    if (Test-Path $item.ArquivoBackupTemp) {
+        Remove-Item $item.ArquivoBackupTemp -Force
+    }
+
+    # Preserva o arquivo antigo caso exista
+    if (Test-Path $item.ArquivoBancoFinal) {
+        $DataHora = Get-Date -Format "yyyyMMdd_HHmmss"
+        $BackupAntigo = "$($item.ArquivoBancoFinal)_OLD_${DataHora}"
+        Write-Host "Guardando copia de seguranca em: $BackupAntigo" -ForegroundColor Yellow
+        Rename-Item -Path $item.ArquivoBancoFinal -NewName (Split-Path $BackupAntigo -Leaf) -Force
+    }
+
+    Move-Item -Path $item.ArquivoBancoNovo -Destination $item.ArquivoBancoFinal -Force
+    Write-Host "[OK] Base do $($item.Sistema) migrada com sucesso em: $($item.ArquivoBancoFinal)" -ForegroundColor Green
 }
 
 # ==========================================
-# 5. RESUMO FINAL DA OPERACAO
+# 7. RESUMO FINAL
 # ==========================================
 Write-Host "`n========================================================" -ForegroundColor Green
-Write-Host "           RELATORIO FINAL DE MIGRACAO                  " -ForegroundColor Green
+Write-Host "           MIGRACAO CONCLUIDA COM SUCESSO!              " -ForegroundColor Green
 Write-Host "========================================================" -ForegroundColor Green
-if ($BancosMigradosComSucesso.Count -gt 0) {
-    Write-Host "Bancos migrados para o Firebird 5.0 (Porta 53055):" -ForegroundColor Cyan
-    foreach ($item in $BancosMigradosComSucesso) {
-        Write-Host " - $item" -ForegroundColor Green
-    }
-} else {
-    Write-Host "Nenhuma base foi processada." -ForegroundColor Yellow
+Write-Host "Porta unificada mantida: $PortaPadrao (Terminais nao necessitam alteracao)" -ForegroundColor Cyan
+Write-Host "Arquivos de configuracao (.INI): Mantidos intactos sem necessidade de alteracao.`n" -ForegroundColor Cyan
+Write-Host "Bancos migrados:" -ForegroundColor Yellow
+foreach ($item in $FilaDeBancos) {
+    Write-Host " - $($item.Sistema): $($item.ArquivoBancoFinal)" -ForegroundColor Green
 }
 Write-Host "========================================================" -ForegroundColor Green
