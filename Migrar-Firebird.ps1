@@ -403,28 +403,60 @@ $BtnIniciar.Add_Click({
 
         # Remoção do Firebird 2.5
         function PararEDesinstalarServicosFB25($pastaFB25) {
-            Log "Verificando serviços do Firebird 2.5 (Server e Guardian)..."
+            Log "Procurando variações dos serviços Firebird 2.5 da Fortes..."
 
             $instSvc25 = Join-Path $pastaFB25 "bin\instsvc.exe"
             $instancia = "Fortes_FB2_5"
 
-            # Lista ordenada dos serviços: Guardian primeiro, Server depois
-            $servicos = @(
-                "FirebirdGuardian$instancia",
-                "FirebirdServer$instancia"
+            # 1. Tentativa de remoção via utilitário nativo do Firebird
+            if (Test-Path $instSvc25) {
+                Log "Tentando remoção elegante via instsvc.exe..."
+                Start-Process -FilePath $instSvc25 -ArgumentList "stop -name $instancia" -Wait -NoNewWindow -ErrorAction SilentlyContinue
+                Start-Process -FilePath $instSvc25 -ArgumentList "remove -name $instancia" -Wait -NoNewWindow -ErrorAction SilentlyContinue
+            }
+
+            # 2. Localiza os serviços (Guardian primeiro, depois Server)
+            $padroes = @(
+                "*firebird*guardian*fortes*fb2*",
+                "*firebird*server*fortes*fb2*"
             )
 
-            # 1. Tentativa limpa via instsvc.exe oficial do Firebird
-            # 'stop -g' e 'remove -g' lidam tanto com o Guardian quanto com a instância associada
-            if (Test-Path $instSvc25) {
-                try {
-                    Log "Removendo instância '$instancia' via instsvc.exe..."
-                    Start-Process -FilePath $instSvc25 -ArgumentList "stop $instancia" -Wait -NoNewWindow
-                    Start-Process -FilePath $instSvc25 -ArgumentList "remove $instancia" -Wait -NoNewWindow
-                } catch {
-                    Log "Aviso ao executar instsvc.exe: $_"
+            foreach ($padrao in $padroes) {
+                $servicos = Get-Service -Name $padrao -ErrorAction SilentlyContinue
+
+                foreach ($svc in $servicos) {
+                    $nomeSvc = $svc.Name
+                    Log "Processando serviço: $nomeSvc"
+
+                    # 3. Garante que o serviço esteja completamente parado
+                    if ($svc.Status -ne 'Stopped') {
+                        Log "Parando serviço $nomeSvc..."
+                        Stop-Service -Name $nomeSvc -Force -ErrorAction SilentlyContinue
+                        
+                        try {
+                            $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(10))
+                        } catch {
+                            Log "Aviso: Tempo limite atingido ao aguardar parada de $nomeSvc."
+                        }
+                    }
+
+                    # 4. Remoção com validação de retorno do Windows
+                    $wmiSvc = Get-CimInstance Win32_Service -Filter "Name = '$nomeSvc'" -ErrorAction SilentlyContinue
+                    if ($wmiSvc) {
+                        $resultado = Invoke-CimMethod -InputObject $wmiSvc -MethodName Delete -ErrorAction SilentlyContinue
+                        
+                        if ($resultado.ReturnValue -eq 0) {
+                            Log "Serviço $nomeSvc removido com sucesso."
+                        } else {
+                            Log "Falha ao remover serviço $nomeSvc. Código de retorno WMI: $($resultado.ReturnValue) (Certifique-se de executar como Administrador)."
+                        }
+                    } else {
+                        Log "Serviço $nomeSvc já foi removido pelo instsvc."
+                    }
                 }
             }
+        
+        
 
             # 2. Varredura direta e segura nos nomes exatos dos dois serviços
             foreach ($nomeServico in $servicos) {
