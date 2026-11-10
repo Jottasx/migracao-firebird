@@ -156,7 +156,7 @@ $TimerAtualizacao.Add_Tick({
     $ProgressBar.Maximum = $SyncHash.MaxProgress
     $ProgressBar.Value   = [Math]::Min($SyncHash.Progress, $SyncHash.MaxProgress)
 
-    # 1. Drena logs gerais em bloco único
+    # 1. Drena logs gerais
     if ($SyncHash.LogQueue.Count -gt 0) {
         $logsParaEscrever = @()
         [System.Threading.Monitor]::Enter($SyncHash.LogQueue.SyncRoot)
@@ -171,7 +171,7 @@ $TimerAtualizacao.Add_Tick({
         }
     }
 
-    # 2. Drena saída do GBAK em bloco único e limita tamanho do buffer na tela
+    # 2. Drena saída do GBAK
     if ($SyncHash.GbakQueue.Count -gt 0) {
         $gbakParaEscrever = @()
         [System.Threading.Monitor]::Enter($SyncHash.GbakQueue.SyncRoot)
@@ -401,18 +401,64 @@ $BtnIniciar.Add_Click({
             return $proc.ExitCode
         }
 
+        # Função inteligente para localizar e parar serviços do Firebird 2.5
+        function PararEDesinstalarServicosFB25($pastaFB25, $nomeInstanciaFB50) {
+            Log "Procurando serviços do Firebird 2.5 no Windows..."
+
+            $instSvc25 = Join-Path $pastaFB25 "bin\instsvc.exe"
+
+            # 1. Tenta remoção elegante via instsvc.exe se existir
+            if (Test-Path $instSvc25) {
+                try {
+                    Log "Executando remoção padrão via instsvc.exe do FB 2.5..."
+                    & $instSvc25 stop Fortes_FB2_5 >$null 2>&1
+                    & $instSvc25 remove Fortes_FB2_5 >$null 2>&1
+                    & $instSvc25 stop >$null 2>&1
+                    & $instSvc25 remove >$null 2>&1
+                } catch {}
+            }
+
+            # 2. Varredura ampla via WMI/CIM para pegar qualquer serviço legado do 2.5
+            $servicosCandidatos = Get-CimInstance Win32_Service | Where-Object {
+                ($_.Name -match "Firebird|FB2" -or $_.DisplayName -match "Firebird|FB2") -and
+                ($_.Name -notmatch $nomeInstanciaFB50 -and $_.DisplayName -notmatch $nomeInstanciaFB50)
+            }
+
+            foreach ($svc in $servicosCandidatos) {
+                # Verifica se o executável do serviço aponta para o diretório do 2.5 ou similar
+                $caminhoBin = $svc.PathName
+                if ($caminhoBin -match "Firebird_2_5" -or $caminhoBin -match "Firebird 2.5" -or $svc.Name -match "FB2") {
+                    Log "Parando serviço identificado: $($svc.Name)..."
+                    try {
+                        Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+                    } catch {}
+
+                    Log "Removendo serviço: $($svc.Name)..."
+                    sc.exe delete "$($svc.Name)" | Out-Null
+                }
+            }
+
+            # 3. Garante o encerramento forçado de qualquer processo órfão do FB 2.5
+            try {
+                Get-Process -Name "fbserver", "fbguard" -ErrorAction SilentlyContinue | Where-Object {
+                    $_.Path -match "Firebird_2_5" -or $_.Path -match "Firebird 2.5"
+                } | Stop-Process -Force -ErrorAction SilentlyContinue
+            } catch {}
+
+            Start-Sleep -Seconds 2
+        }
+
         try {
             $PastaDestinoFB50     = "C:\Fortes\Firebird\Firebird_5_0"
+            $PastaDestinoFB25     = "C:\Fortes\Firebird\Firebird_2_5"
             $ZipOrigemFB50        = Join-Path $ScriptDir "Binarios\Firebird_5_0.zip"
-            $CaminhoFB25_Gbak     = "C:\Fortes\Firebird\Firebird_2_5\bin\gbak.exe"
+            $CaminhoFB25_Gbak     = Join-Path $PastaDestinoFB25 "bin\gbak.exe"
             $CaminhoFB50_Gbak     = Join-Path $PastaDestinoFB50 "gbak.exe"
             $CaminhoFB50_InstSvc  = Join-Path $PastaDestinoFB50 "instsvc.exe"
             $CaminhoFB50_InstReg  = Join-Path $PastaDestinoFB50 "instreg.exe"
             $PortaPadrao          = "53052"
             $UsuarioFB            = "SYSDBA"
             $SenhaFB              = "masterkey"
-            $ServicoFB25_Server   = "FirebirdServerFortes_FB2_5"
-            $ServicoFB25_Guardian = "FirebirdGuardianFortes_FB2_5"
             $NomeInstanciaFB50    = "Fortes_FB5_0"
             $ServicoFB50_Server   = "FirebirdServer$NomeInstanciaFB50"
 
@@ -451,9 +497,9 @@ $BtnIniciar.Add_Click({
 
             # 2. Backups via FB 2.5
             Log "Reiniciando Firebird 2.5 para fechar conexões ativas..."
-            if (Get-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue) { Stop-Service -Name $ServicoFB25_Guardian -Force -ErrorAction SilentlyContinue }
-            if (Get-Service -Name $ServicoFB25_Server -ErrorAction SilentlyContinue) { Restart-Service -Name $ServicoFB25_Server -Force }
-            if (Get-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue) { Start-Service -Name $ServicoFB25_Guardian -ErrorAction SilentlyContinue }
+            Get-Service | Where-Object { $_.Name -like "*Firebird*2_5*" -or $_.Name -like "*Fortes_FB2_5*" } | ForEach-Object {
+                Restart-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
+            }
 
             foreach ($item in $Fila) {
                 $Sync.StatusText = "Extraindo backup do sistema: $($item.Sistema)..."
@@ -475,14 +521,9 @@ $BtnIniciar.Add_Click({
                 $Sync.Progress++
             }
 
-            # 3. Transição dos Serviços
+            # 3. Transição de Serviços com Limpeza Profunda do 2.5
             $Sync.StatusText = "Realizando transição de motores na porta $PortaPadrao..."
-            Log "Parando e desinstalando serviços do Firebird 2.5..."
-            Stop-Service -Name $ServicoFB25_Guardian -Force -ErrorAction SilentlyContinue
-            Stop-Service -Name $ServicoFB25_Server -Force -ErrorAction SilentlyContinue
-            sc.exe delete $ServicoFB25_Guardian | Out-Null
-            sc.exe delete $ServicoFB25_Server | Out-Null
-            Start-Sleep -Seconds 2
+            PararEDesinstalarServicosFB25 -pastaFB25 $PastaDestinoFB25 -nomeInstanciaFB50 $NomeInstanciaFB50
 
             Log "Iniciando serviço do Firebird 5.0 na porta $PortaPadrao..."
             Start-Service -Name $ServicoFB50_Server
@@ -514,10 +555,22 @@ $BtnIniciar.Add_Click({
 
                 if (Test-Path $item.ArquivoBackupTemp) { Remove-Item $item.ArquivoBackupTemp -Force }
 
+                # Nomenclatura oficial do backup: Backup_<Sistema>_<dd_MM_yyyy>_FB_2_5.fdb
                 if (Test-Path $item.ArquivoBancoFinal) {
-                    $BackupAntigo = "$($item.ArquivoBancoFinal)_OLD_$((Get-Date).ToString('yyyyMMdd_HHmmss'))"
-                    Rename-Item -Path $item.ArquivoBancoFinal -NewName (Split-Path $BackupAntigo -Leaf) -Force
-                    Log "Base anterior arquivada em: $(Split-Path $BackupAntigo -Leaf)"
+                    $DataFormatada = (Get-Date).ToString("dd_MM_yyyy")
+                    $DiretorioBanco = [System.IO.Path]::GetDirectoryName($item.ArquivoBancoFinal)
+                    $NomeBackupPadrao = "Backup_$($item.Sistema)_${DataFormatada}_FB_2_5.fdb"
+                    $CaminhoBackupFinal = Join-Path $DiretorioBanco $NomeBackupPadrao
+
+                    # Se já existir um backup gerado no mesmo dia, adiciona hora para não sobrescrever
+                    if (Test-Path $CaminhoBackupFinal) {
+                        $HoraFormatada = (Get-Date).ToString("HHmmss")
+                        $NomeBackupPadrao = "Backup_$($item.Sistema)_${DataFormatada}_${HoraFormatada}_FB_2_5.fdb"
+                        $CaminhoBackupFinal = Join-Path $DiretorioBanco $NomeBackupPadrao
+                    }
+
+                    Rename-Item -Path $item.ArquivoBancoFinal -NewName $NomeBackupPadrao -Force
+                    Log "Base legado preservada como: $NomeBackupPadrao"
                 }
 
                 Move-Item -Path $item.ArquivoBancoNovo -Destination $item.ArquivoBancoFinal -Force
