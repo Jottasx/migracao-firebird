@@ -15,10 +15,18 @@ Add-Type -AssemblyName System.Drawing
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# --- CONFIGURAÇÃO DE DIRETÓRIO E ARQUIVO DE LOG ÚNICO ---
+$DiretorioLogs = "C:\Fortes\Logs"
+if (-not (Test-Path $DiretorioLogs)) {
+    New-Item -ItemType Directory -Path $DiretorioLogs -Force | Out-Null
+}
+$DataHoraExecucao = (Get-Date).ToString("yyyyMMdd_HHmmss")
+$CaminhoArquivoLog = Join-Path $DiretorioLogs "Migracao_FB25_FB50_$DataHoraExecucao.txt"
+
 # --- CONFIGURAÇÃO DA JANELA PRINCIPAL ---
 $Form = New-Object System.Windows.Forms.Form
 $Form.Text = "Migrador Firebird 2.5 -> 5.0 (Fortes Tecnologia)"
-$Form.Size = New-Object System.Drawing.Size(820, 765)
+$Form.Size = New-Object System.Drawing.Size(820, 775)
 $Form.StartPosition = "CenterScreen"
 $Form.FormBorderStyle = "FixedDialog"
 $Form.MaximizeBox = $false
@@ -78,16 +86,23 @@ $Form.Controls.Add($GrpProgresso)
 $LblStatus = New-Object System.Windows.Forms.Label
 $LblStatus.Text = "Aguardando seleção de bases para iniciar..."
 $LblStatus.Location = New-Object System.Drawing.Point(15, 20)
-$LblStatus.Size = New-Object System.Drawing.Size(745, 20)
+$LblStatus.Size = New-Object System.Drawing.Size(620, 20)
 $LblStatus.Font = $FontTitulo
 $GrpProgresso.Controls.Add($LblStatus)
+
+$BtnAbrirLog = New-Object System.Windows.Forms.Button
+$BtnAbrirLog.Text = "Ver Log (.txt)"
+$BtnAbrirLog.Location = New-Object System.Drawing.Point(645, 17)
+$BtnAbrirLog.Size = New-Object System.Drawing.Size(115, 25)
+$BtnAbrirLog.Enabled = $false
+$GrpProgresso.Controls.Add($BtnAbrirLog)
 
 $ProgressBar = New-Object System.Windows.Forms.ProgressBar
 $ProgressBar.Location = New-Object System.Drawing.Point(15, 45)
 $ProgressBar.Size = New-Object System.Drawing.Size(745, 22)
 $GrpProgresso.Controls.Add($ProgressBar)
 
-# 3. Seção: Monitor em Tempo Real do GBAK (Tabelas / Índices)
+# 3. Seção: Monitor em Tempo Real do GBAK
 $GrpGbak = New-Object System.Windows.Forms.GroupBox
 $GrpGbak.Text = "Acompanhamento do GBAK em Tempo Real (Tabelas e Índices)"
 $GrpGbak.Location = New-Object System.Drawing.Point(15, 260)
@@ -126,7 +141,7 @@ $GrpLogs.Controls.Add($TxtLogs)
 # 5. Rodapé: Créditos do Desenvolvedor
 $LblCreditos = New-Object System.Windows.Forms.Label
 $LblCreditos.Text = "Desenvolvido por Pedro Mesquita (pedromesquita@fortestecnologia.com.br)"
-$LblCreditos.Location = New-Object System.Drawing.Point(15, 702)
+$LblCreditos.Location = New-Object System.Drawing.Point(15, 705)
 $LblCreditos.Size = New-Object System.Drawing.Size(775, 18)
 $LblCreditos.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
 $LblCreditos.ForeColor = [System.Drawing.Color]::Gray
@@ -143,6 +158,7 @@ $SyncHash = [hashtable]::Synchronized(@{
     MaxProgress   = 100
     Concluido     = $false
     Erro          = $null
+    CaminhoLog    = $CaminhoArquivoLog
 })
 
 # Timer regulado para 150ms com Flush em Bloco
@@ -232,16 +248,23 @@ $TimerAtualizacao.Add_Tick({
         $BtnAdicionar.Enabled = $true
         $BtnRemover.Enabled   = $true
         $BtnIniciar.Enabled   = $true
+        $BtnAbrirLog.Enabled  = (Test-Path $SyncHash.CaminhoLog)
 
         if ($SyncHash.Erro) {
             [System.Windows.Forms.MessageBox]::Show("A migração falhou:`n$($SyncHash.Erro)", "Erro", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
         } else {
-            [System.Windows.Forms.MessageBox]::Show("Processo de migração concluído com sucesso!", "Sucesso", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+            [System.Windows.Forms.MessageBox]::Show("Processo de migração concluído com sucesso!`nArquivo de log gerado em:`n$($SyncHash.CaminhoLog)", "Sucesso", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
         }
     }
 })
 
 # --- EVENTOS DOS BOTÕES ---
+$BtnAbrirLog.Add_Click({
+    if (Test-Path $SyncHash.CaminhoLog) {
+        Start-Process "notepad.exe" -ArgumentList "`"$($SyncHash.CaminhoLog)`""
+    }
+})
+
 $BtnAdicionar.Add_Click({
     $Dialog = New-Object System.Windows.Forms.OpenFileDialog
     $Dialog.Title = "Selecione a base Firebird (.FDB)"
@@ -304,6 +327,7 @@ $BtnIniciar.Add_Click({
     $BtnAdicionar.Enabled = $false
     $BtnRemover.Enabled   = $false
     $BtnIniciar.Enabled   = $false
+    $BtnAbrirLog.Enabled  = $false
     $TxtLogs.Clear()
     $TxtGbak.Clear()
 
@@ -322,6 +346,7 @@ $BtnIniciar.Add_Click({
             Index             = $i
             Sistema           = $Sis
             BancoOrigem       = $Cam
+            Diretorio         = $Dir
             ArquivoBackupTemp = Join-Path $Dir "temp_migracao_$Sis.fbk"
             ArquivoBancoNovo  = Join-Path $Dir "temp_fb50_$Sis.fdb"
             ArquivoBancoFinal = Join-Path $Dir "$Sis.fdb"
@@ -341,13 +366,24 @@ $BtnIniciar.Add_Click({
         param($Sync, $Fila, $ScriptDir)
 
         function Log($txt) {
-            $timestamp = (Get-Date).ToString("HH:mm:ss")
-            $Sync.LogQueue.Add("[$timestamp] $txt") | Out-Null
+            $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            $entrada = "[$timestamp] $txt"
+            
+            # 1. Envia para a interface gráfica
+            $Sync.LogQueue.Add($entrada) | Out-Null
+            
+            # 2. Grava no arquivo TXT central
+            try {
+                [System.IO.File]::AppendAllText($Sync.CaminhoLog, "$entrada`r`n", [System.Text.Encoding]::UTF8)
+            } catch {}
         }
 
-        function ExecutarGbakComMonitor($executavel, $argumentos) {
+        # Monitor do GBAK com gravação integral no arquivo de log
+        function ExecutarGbakComMonitor($executavel, $argumentos, $tipoOperacao, $nomeSistema) {
             $logTemp = [System.IO.Path]::GetTempFileName()
 
+            Log "Iniciando execução do GBAK ($tipoOperacao) para $nomeSistema..."
+            
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = "cmd.exe"
             $psi.Arguments = "/c `"`"$executavel`" $argumentos > `"$logTemp`" 2>&1`""
@@ -364,14 +400,21 @@ $BtnIniciar.Add_Click({
                         if ($fs.Length -gt $lastPos) {
                             $fs.Seek($lastPos, [System.IO.SeekOrigin]::Begin) | Out-Null
                             $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::Default)
+                            $bufferLoteLog = [System.Text.StringBuilder]::new()
+
                             while (-not $sr.EndOfStream) {
                                 $linha = $sr.ReadLine()
                                 if ($linha) {
                                     $Sync.GbakQueue.Add($linha) | Out-Null
+                                    [void]$bufferLoteLog.AppendLine("[GBAK] $linha")
                                 }
                             }
                             $lastPos = $fs.Position
                             $sr.Close()
+
+                            if ($bufferLoteLog.Length -gt 0) {
+                                [System.IO.File]::AppendAllText($Sync.CaminhoLog, $bufferLoteLog.ToString(), [System.Text.Encoding]::UTF8)
+                            }
                         }
                         $fs.Close()
                     } catch {}
@@ -379,43 +422,50 @@ $BtnIniciar.Add_Click({
                 Start-Sleep -Milliseconds 250
             }
 
+            # Drena os dados finais residuais
             if (Test-Path $logTemp) {
                 try {
                     $fs = New-Object System.IO.FileStream($logTemp, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
                     if ($fs.Length -gt $lastPos) {
                         $fs.Seek($lastPos, [System.IO.SeekOrigin]::Begin) | Out-Null
                         $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::Default)
+                        $bufferLoteLog = [System.Text.StringBuilder]::new()
+
                         while (-not $sr.EndOfStream) {
                             $linha = $sr.ReadLine()
                             if ($linha) {
                                 $Sync.GbakQueue.Add($linha) | Out-Null
+                                [void]$bufferLoteLog.AppendLine("[GBAK] $linha")
                             }
                         }
                         $sr.Close()
+
+                        if ($bufferLoteLog.Length -gt 0) {
+                            [System.IO.File]::AppendAllText($Sync.CaminhoLog, $bufferLoteLog.ToString(), [System.Text.Encoding]::UTF8)
+                        }
                     }
                     $fs.Close()
                     Remove-Item $logTemp -Force -ErrorAction SilentlyContinue
                 } catch {}
             }
 
+            Log "Finalizado GBAK ($tipoOperacao) para $nomeSistema com código de saída: $($proc.ExitCode)"
             return $proc.ExitCode
         }
 
-        # Remoção do Firebird 2.5
+        # Remoção dos serviços do Firebird 2.5
         function PararEDesinstalarServicosFB25($pastaFB25) {
             Log "Procurando variações dos serviços Firebird 2.5 da Fortes..."
 
             $instSvc25 = Join-Path $pastaFB25 "bin\instsvc.exe"
             $instancia = "Fortes_FB2_5"
 
-            # 1. Tentativa de remoção via utilitário nativo do Firebird
             if (Test-Path $instSvc25) {
-                Log "Tentando remoção elegante via instsvc.exe..."
+                Log "Executando parada e desinstalação via instsvc.exe..."
                 Start-Process -FilePath $instSvc25 -ArgumentList "stop -name $instancia" -Wait -NoNewWindow -ErrorAction SilentlyContinue
                 Start-Process -FilePath $instSvc25 -ArgumentList "remove -name $instancia" -Wait -NoNewWindow -ErrorAction SilentlyContinue
             }
 
-            # 2. Localiza os serviços (Guardian primeiro, depois Server)
             $padroes = @(
                 "*firebird*guardian*fortes*fb2*",
                 "*firebird*server*fortes*fb2*"
@@ -428,7 +478,6 @@ $BtnIniciar.Add_Click({
                     $nomeSvc = $svc.Name
                     Log "Processando serviço: $nomeSvc"
 
-                    # 3. Garante que o serviço esteja completamente parado
                     if ($svc.Status -ne 'Stopped') {
                         Log "Parando serviço $nomeSvc..."
                         Stop-Service -Name $nomeSvc -Force -ErrorAction SilentlyContinue
@@ -436,53 +485,34 @@ $BtnIniciar.Add_Click({
                         try {
                             $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(10))
                         } catch {
-                            Log "Aviso: Tempo limite atingido ao aguardar parada de $nomeSvc."
+                            Log "Aviso: Tempo limite ao aguardar parada de $nomeSvc."
                         }
                     }
 
-                    # 4. Remoção com validação de retorno do Windows
+                    Log "Removendo registro do serviço $nomeSvc via CIM..."
                     $wmiSvc = Get-CimInstance Win32_Service -Filter "Name = '$nomeSvc'" -ErrorAction SilentlyContinue
                     if ($wmiSvc) {
                         $resultado = Invoke-CimMethod -InputObject $wmiSvc -MethodName Delete -ErrorAction SilentlyContinue
-                        
                         if ($resultado.ReturnValue -eq 0) {
                             Log "Serviço $nomeSvc removido com sucesso."
                         } else {
-                            Log "Falha ao remover serviço $nomeSvc. Código de retorno WMI: $($resultado.ReturnValue) (Certifique-se de executar como Administrador)."
+                            Log "Aviso: Falha ao remover serviço $nomeSvc (Código WMI: $($resultado.ReturnValue))."
                         }
                     } else {
                         Log "Serviço $nomeSvc já foi removido pelo instsvc."
                     }
                 }
             }
-        
-        
-
-            # 2. Varredura direta e segura nos nomes exatos dos dois serviços
-            foreach ($nomeServico in $servicos) {
-                $svc = Get-Service -Name $nomeServico -ErrorAction SilentlyContinue
-
-                if ($svc) {
-                    if ($svc.Status -ne 'Stopped') {
-                        Log "Parando serviço: $nomeServico..."
-                        Stop-Service -Name $nomeServico -Force -ErrorAction SilentlyContinue
-                        $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(10))
-                    }
-
-                    # Remove via CIM apenas se o serviço ainda constar no Windows após o instsvc
-                    Log "Removendo registro do serviço: $nomeServico..."
-                    $wmiSvc = Get-CimInstance Win32_Service -Filter "Name = '$nomeServico'" -ErrorAction SilentlyContinue
-                    if ($wmiSvc) {
-                        Invoke-CimMethod -InputObject $wmiSvc -MethodName Delete | Out-Null
-                        Log "Serviço $nomeServico removido com sucesso."
-                    }
-                } else {
-                    Log "Serviço $nomeServico não encontrado ou já removido."
-                }
-            }
         }
 
+        # Fluxo de execução
         try {
+            Log "=========================================================="
+            Log "INÍCIO DO PROCESSO DE MIGRAÇÃO: FB 2.5 -> FB 5.0"
+            Log "Usuário Atual: $env:USERNAME em $env:COMPUTERNAME"
+            Log "Arquivo de Registro: $($Sync.CaminhoLog)"
+            Log "=========================================================="
+
             $PastaDestinoFB50     = "C:\Fortes\Firebird\Firebird_5_0"
             $PastaDestinoFB25     = "C:\Fortes\Firebird\Firebird_2_5"
             $ZipOrigemFB50        = Join-Path $ScriptDir "Binarios\Firebird_5_0.zip"
@@ -507,7 +537,7 @@ $BtnIniciar.Add_Click({
                 Log "Extraindo binários para $PastaDestinoFB50..."
                 if (-not (Test-Path $PastaDestinoFB50)) { New-Item -ItemType Directory -Path $PastaDestinoFB50 -Force | Out-Null }
                 Expand-Archive -Path $ZipOrigemFB50 -DestinationPath $PastaDestinoFB50 -Force
-                Log "Extração finalizada."
+                Log "Extração finalizada com sucesso."
             }
 
             if (Test-Path $CaminhoFB50_InstReg) {
@@ -516,16 +546,16 @@ $BtnIniciar.Add_Click({
 
             $ServicoFB50 = Get-Service -Name $ServicoFB50_Server -ErrorAction SilentlyContinue
             if (-not $ServicoFB50) {
-                Log "Registrando serviço do Firebird 5.0..."
+                Log "Registrando serviço do Firebird 5.0 ($NomeInstanciaFB50)..."
                 & $CaminhoFB50_InstSvc install -auto -name $NomeInstanciaFB50
                 Start-Sleep -Seconds 2
             }
 
-            Log "Garantindo porta $PortaPadrao no Firewall do Windows..."
+            Log "Garantindo regra de porta $PortaPadrao no Firewall do Windows..."
             $NomeRegra = "Firebird Fortes (Porta $PortaPadrao)"
             netsh advfirewall firewall delete rule name="$NomeRegra" >$null 2>&1
             netsh advfirewall firewall add rule name="$NomeRegra" dir=in action=allow protocol=TCP localport=$PortaPadrao profile=any >$null
-            Log "Firewall validado para a porta $PortaPadrao."
+            Log "Firewall liberado para a porta $PortaPadrao."
 
             $Sync.Progress++
 
@@ -537,42 +567,42 @@ $BtnIniciar.Add_Click({
 
             foreach ($item in $Fila) {
                 $Sync.StatusText = "Extraindo backup do sistema: $($item.Sistema)..."
-                Log "Iniciando gbak (Backup) para $($item.Sistema)..."
+                Log "Iniciando processo de backup da base: $($item.BancoOrigem)"
                 $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Extraindo Backup..."; Tipo = "Processando" }) | Out-Null
 
                 $ConexaoFB25 = "localhost/${PortaPadrao}:$($item.BancoOrigem)"
                 $argsGbak = "-b -v -g `"$ConexaoFB25`" `"$($item.ArquivoBackupTemp)`" -user $UsuarioFB -password $SenhaFB"
                 
-                $exitCode = ExecutarGbakComMonitor $CaminhoFB25_Gbak $argsGbak
+                $exitCode = ExecutarGbakComMonitor $CaminhoFB25_Gbak $argsGbak "BACKUP" $item.Sistema
 
                 if ($exitCode -ne 0 -or -not (Test-Path $item.ArquivoBackupTemp)) {
                     $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Erro no Backup"; Tipo = "Erro" }) | Out-Null
-                    throw "Falha ao extrair backup da base $($item.Sistema)."
+                    throw "Falha crítica ao extrair backup da base $($item.Sistema). Código de saída do GBAK: $exitCode."
                 }
                 
-                Log "Backup do $($item.Sistema) extraído com sucesso."
+                Log "Backup do $($item.Sistema) finalizado com sucesso no arquivo $($item.ArquivoBackupTemp)."
                 $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Backup Concluído"; Tipo = "Processando" }) | Out-Null
                 $Sync.Progress++
             }
 
-            # 3. Transição de Serviços com Limpeza Profunda do 2.5
+            # 3. Transição de Motores
             $Sync.StatusText = "Realizando transição de motores na porta $PortaPadrao..."
-            PararEDesinstalarServicosFB25 -pastaFB25 $PastaDestinoFB25 -nomeInstanciaFB50 $NomeInstanciaFB50
+            PararEDesinstalarServicosFB25 -pastaFB25 $PastaDestinoFB25
 
             Log "Iniciando serviço do Firebird 5.0 na porta $PortaPadrao..."
             Start-Service -Name $ServicoFB50_Server
             Start-Sleep -Seconds 3
 
             if ((Get-Service -Name $ServicoFB50_Server).Status -ne "Running") {
-                throw "O Firebird 5.0 não conseguiu iniciar na porta $PortaPadrao. Verifique o firebird.conf."
+                throw "O serviço Firebird 5.0 não conseguiu iniciar na porta $PortaPadrao."
             }
-            Log "Firebird 5.0 operacional na porta $PortaPadrao."
+            Log "Firebird 5.0 operacional e escutando na porta $PortaPadrao."
             $Sync.Progress++
 
             # 4. Restaurações via FB 5.0
             foreach ($item in $Fila) {
                 $Sync.StatusText = "Restaurando base do sistema: $($item.Sistema)..."
-                Log "Iniciando gbak (Restore) de $($item.Sistema) (ODS 13.x, Page Size 8192)..."
+                Log "Iniciando restauração da base $($item.Sistema) (ODS 13.x, Page Size 8192)..."
                 $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Restaurando..."; Tipo = "Processando" }) | Out-Null
 
                 if (Test-Path $item.ArquivoBancoNovo) { Remove-Item $item.ArquivoBancoNovo -Force }
@@ -580,23 +610,22 @@ $BtnIniciar.Add_Click({
                 $ConexaoFB50 = "localhost/${PortaPadrao}:$($item.ArquivoBancoNovo)"
                 $argsGbakRestore = "-c -v -p 8192 `"$($item.ArquivoBackupTemp)`" `"$ConexaoFB50`" -user $UsuarioFB -password $SenhaFB"
 
-                $exitCode = ExecutarGbakComMonitor $CaminhoFB50_Gbak $argsGbakRestore
+                $exitCode = ExecutarGbakComMonitor $CaminhoFB50_Gbak $argsGbakRestore "RESTORE" $item.Sistema
 
                 if ($exitCode -ne 0 -or -not (Test-Path $item.ArquivoBancoNovo)) {
                     $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Erro no Restore"; Tipo = "Erro" }) | Out-Null
-                    throw "Falha ao restaurar $($item.Sistema) no Firebird 5.0."
+                    throw "Falha crítica ao restaurar $($item.Sistema) no Firebird 5.0. Código de saída do GBAK: $exitCode."
                 }
 
                 if (Test-Path $item.ArquivoBackupTemp) { Remove-Item $item.ArquivoBackupTemp -Force }
 
-                # Nomenclatura oficial do backup: Backup_<Sistema>_<dd_MM_yyyy>_FB_2_5.fdb
+                # Nomenclatura oficial de preservação da base legado
                 if (Test-Path $item.ArquivoBancoFinal) {
                     $DataFormatada = (Get-Date).ToString("dd_MM_yyyy")
-                    $DiretorioBanco = [System.IO.Path]::GetDirectoryName($item.ArquivoBancoFinal)
+                    $DiretorioBanco = $item.Diretorio
                     $NomeBackupPadrao = "Backup_$($item.Sistema)_${DataFormatada}_FB_2_5.fdb"
                     $CaminhoBackupFinal = Join-Path $DiretorioBanco $NomeBackupPadrao
 
-                    # Se já existir um backup gerado no mesmo dia, adiciona hora para não sobrescrever
                     if (Test-Path $CaminhoBackupFinal) {
                         $HoraFormatada = (Get-Date).ToString("HHmmss")
                         $NomeBackupPadrao = "Backup_$($item.Sistema)_${DataFormatada}_${HoraFormatada}_FB_2_5.fdb"
@@ -604,19 +633,20 @@ $BtnIniciar.Add_Click({
                     }
 
                     Rename-Item -Path $item.ArquivoBancoFinal -NewName $NomeBackupPadrao -Force
-                    Log "Base legado preservada como: $NomeBackupPadrao"
+                    Log "Base legado de segurança preservada como: $NomeBackupPadrao"
                 }
 
                 Move-Item -Path $item.ArquivoBancoNovo -Destination $item.ArquivoBancoFinal -Force
-                Log "Base $($item.Sistema) disponível em: $($item.ArquivoBancoFinal)"
+                Log "Base $($item.Sistema) migrada com sucesso disponível em: $($item.ArquivoBancoFinal)"
 
-                # SINALIZAÇÃO VISUAL: Base finalizada com destaque em verde
                 $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Concluído [OK]"; Tipo = "Concluido" }) | Out-Null
                 $Sync.Progress++
             }
 
             $Sync.StatusText = "Migração concluída com sucesso!"
-            Log "Todas as bases foram migradas e os arquivos .INI mantidos intactos."
+            Log "=========================================================="
+            Log "MIGRAÇÃO FINALIZADA COM SUCESSO."
+            Log "=========================================================="
         } catch {
             $Sync.Erro = $_.Exception.Message
             Log "[FALHA CRÍTICA] $($_.Exception.Message)"
