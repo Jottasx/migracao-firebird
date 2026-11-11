@@ -378,77 +378,62 @@ $BtnIniciar.Add_Click({
             } catch {}
         }
 
-        # Monitor do GBAK com gravação integral no arquivo de log
-        function ExecutarGbakComMonitor($executavel, $argumentos, $tipoOperacao, $nomeSistema) {
-            $logTemp = [System.IO.Path]::GetTempFileName()
+        # Funções para controle de isolamento de rede via Firewall
+        $PortaPadrao = "53052"
+        $NomeRegraLiberacao = "Firebird Fortes (Porta $PortaPadrao)"
+        $NomeRegraBloqueio  = "Bloqueio Temporario Migracao Fortes (Porta $PortaPadrao)"
 
-            Log "Iniciando execução do GBAK ($tipoOperacao) para $nomeSistema..."
-            
+        function BloquearAcessoTerminaisRede {
+            Log "Isolando porta $PortaPadrao no Firewall para evitar conexões de terminais durante o processo..."
+            netsh advfirewall firewall delete rule name="$NomeRegraLiberacao" >$null 2>&1
+            netsh advfirewall firewall delete rule name="$NomeRegraBloqueio" >$null 2>&1
+            netsh advfirewall firewall add rule name="$NomeRegraBloqueio" dir=in action=block protocol=TCP localport=$PortaPadrao profile=any >$null
+            Log "Isolamento de rede ativo. Terminais externos não poderão conectar ao Firebird."
+        }
+
+        function LiberarAcessoTerminaisRede {
+            Log "Restaurando permissão de tráfego de rede para a porta $PortaPadrao..."
+            netsh advfirewall firewall delete rule name="$NomeRegraBloqueio" >$null 2>&1
+            netsh advfirewall firewall delete rule name="$NomeRegraLiberacao" >$null 2>&1
+            netsh advfirewall firewall add rule name="$NomeRegraLiberacao" dir=in action=allow protocol=TCP localport=$PortaPadrao profile=any >$null
+            Log "Acesso de rede para os terminais restaurado com sucesso na porta $PortaPadrao."
+        }
+
+        # Monitor do GBAK por stream direto: 100% compatível com Server 2012 R2, sem buffer de disco
+        function ExecutarGbakComMonitor($executavel, $argumentos, $tipoOperacao, $nomeSistema) {
+            Log "Disparando GBAK ($tipoOperacao) para $nomeSistema..."
+
             $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = "cmd.exe"
-            $psi.Arguments = "/c `"`"$executavel`" $argumentos > `"$logTemp`" 2>&1`""
-            $psi.UseShellExecute = $false
-            $psi.CreateNoWindow = $true
+            $psi.FileName               = $executavel
+            $psi.Arguments              = $argumentos
+            $psi.UseShellExecute        = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError  = $true
+            $psi.CreateNoWindow         = $true
 
             $proc = [System.Diagnostics.Process]::Start($psi)
 
-            $lastPos = 0
-            while (-not $proc.HasExited) {
-                if (Test-Path $logTemp) {
+            # Lê linha por linha em tempo real sem travas de arquivo temporário
+            while (-not $proc.StandardOutput.EndOfStream) {
+                $linha = $proc.StandardOutput.ReadLine()
+                if ($linha) {
+                    $Sync.GbakQueue.Add($linha) | Out-Null
                     try {
-                        $fs = New-Object System.IO.FileStream($logTemp, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-                        if ($fs.Length -gt $lastPos) {
-                            $fs.Seek($lastPos, [System.IO.SeekOrigin]::Begin) | Out-Null
-                            $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::Default)
-                            $bufferLoteLog = [System.Text.StringBuilder]::new()
-
-                            while (-not $sr.EndOfStream) {
-                                $linha = $sr.ReadLine()
-                                if ($linha) {
-                                    $Sync.GbakQueue.Add($linha) | Out-Null
-                                    [void]$bufferLoteLog.AppendLine("[GBAK] $linha")
-                                }
-                            }
-                            $lastPos = $fs.Position
-                            $sr.Close()
-
-                            if ($bufferLoteLog.Length -gt 0) {
-                                [System.IO.File]::AppendAllText($Sync.CaminhoLog, $bufferLoteLog.ToString(), [System.Text.Encoding]::UTF8)
-                            }
-                        }
-                        $fs.Close()
+                        [System.IO.File]::AppendAllText($Sync.CaminhoLog, "[GBAK] $linha`r`n", [System.Text.Encoding]::UTF8)
                     } catch {}
                 }
-                Start-Sleep -Milliseconds 250
             }
 
-            # Drena os dados finais residuais
-            if (Test-Path $logTemp) {
+            # Captura mensagens de erro residuais se houver
+            $erro = $proc.StandardError.ReadToEnd()
+            if ($erro) {
+                $Sync.GbakQueue.Add("[ERRO] $erro") | Out-Null
                 try {
-                    $fs = New-Object System.IO.FileStream($logTemp, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-                    if ($fs.Length -gt $lastPos) {
-                        $fs.Seek($lastPos, [System.IO.SeekOrigin]::Begin) | Out-Null
-                        $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::Default)
-                        $bufferLoteLog = [System.Text.StringBuilder]::new()
-
-                        while (-not $sr.EndOfStream) {
-                            $linha = $sr.ReadLine()
-                            if ($linha) {
-                                $Sync.GbakQueue.Add($linha) | Out-Null
-                                [void]$bufferLoteLog.AppendLine("[GBAK] $linha")
-                            }
-                        }
-                        $sr.Close()
-
-                        if ($bufferLoteLog.Length -gt 0) {
-                            [System.IO.File]::AppendAllText($Sync.CaminhoLog, $bufferLoteLog.ToString(), [System.Text.Encoding]::UTF8)
-                        }
-                    }
-                    $fs.Close()
-                    Remove-Item $logTemp -Force -ErrorAction SilentlyContinue
+                    [System.IO.File]::AppendAllText($Sync.CaminhoLog, "[GBAK-ERRO] $erro`r`n", [System.Text.Encoding]::UTF8)
                 } catch {}
             }
 
+            $proc.WaitForExit()
             Log "Finalizado GBAK ($tipoOperacao) para $nomeSistema com código de saída: $($proc.ExitCode)"
             return $proc.ExitCode
         }
@@ -513,6 +498,9 @@ $BtnIniciar.Add_Click({
             Log "Arquivo de Registro: $($Sync.CaminhoLog)"
             Log "=========================================================="
 
+            # Bloqueio preventivo da porta para cortar tráfego de terminais
+            BloquearAcessoTerminaisRede
+
             $PastaDestinoFB50     = "C:\Fortes\Firebird\Firebird_5_0"
             $PastaDestinoFB25     = "C:\Fortes\Firebird\Firebird_2_5"
             $ZipOrigemFB50        = Join-Path $ScriptDir "Binarios\Firebird_5_0.zip"
@@ -520,7 +508,6 @@ $BtnIniciar.Add_Click({
             $CaminhoFB50_Gbak     = Join-Path $PastaDestinoFB50 "gbak.exe"
             $CaminhoFB50_InstSvc  = Join-Path $PastaDestinoFB50 "instsvc.exe"
             $CaminhoFB50_InstReg  = Join-Path $PastaDestinoFB50 "instreg.exe"
-            $PortaPadrao          = "53052"
             $UsuarioFB            = "SYSDBA"
             $SenhaFB              = "masterkey"
             $NomeInstanciaFB50    = "Fortes_FB5_0"
@@ -551,21 +538,23 @@ $BtnIniciar.Add_Click({
                 Start-Sleep -Seconds 2
             }
 
-            Log "Garantindo regra de porta $PortaPadrao no Firewall do Windows..."
-            $NomeRegra = "Firebird Fortes (Porta $PortaPadrao)"
-            netsh advfirewall firewall delete rule name="$NomeRegra" >$null 2>&1
-            netsh advfirewall firewall add rule name="$NomeRegra" dir=in action=allow protocol=TCP localport=$PortaPadrao profile=any >$null
-            Log "Firewall liberado para a porta $PortaPadrao."
-
             $Sync.Progress++
 
             # 2. Backups via FB 2.5
-            Log "Reiniciando Firebird 2.5 para fechar conexões ativas..."
+            Log "Reiniciando Firebird 2.5 para derrubar eventuais conexões residuais..."
             Get-Service | Where-Object { $_.Name -like "*Firebird*2_5*" -or $_.Name -like "*Fortes_FB2_5*" } | ForEach-Object {
                 Restart-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
             }
 
             foreach ($item in $Fila) {
+                # DETECÇÃO DE BACKUP PRÉ-EXISTENTE: Salta se o .fbk já existir com tamanho válido (> 1MB)
+                if ((Test-Path $item.ArquivoBackupTemp) -and ((Get-Item $item.ArquivoBackupTemp).Length -gt 1MB)) {
+                    Log "Backup pré-existente detectado para $($item.Sistema) ($($item.ArquivoBackupTemp)). Pulando extração..."
+                    $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Backup Já Existente"; Tipo = "Processando" }) | Out-Null
+                    $Sync.Progress++
+                    continue
+                }
+
                 $Sync.StatusText = "Extraindo backup do sistema: $($item.Sistema)..."
                 Log "Iniciando processo de backup da base: $($item.BancoOrigem)"
                 $Sync.ItemUpdates.Add(@{ Index = $item.Index; Status = "Extraindo Backup..."; Tipo = "Processando" }) | Out-Null
@@ -619,7 +608,7 @@ $BtnIniciar.Add_Click({
 
                 if (Test-Path $item.ArquivoBackupTemp) { Remove-Item $item.ArquivoBackupTemp -Force }
 
-                # Nomenclatura oficial de preservação da base legado
+                # Preservação da base legado
                 if (Test-Path $item.ArquivoBancoFinal) {
                     $DataFormatada = (Get-Date).ToString("dd_MM_yyyy")
                     $DiretorioBanco = $item.Diretorio
@@ -652,6 +641,8 @@ $BtnIniciar.Add_Click({
             Log "[FALHA CRÍTICA] $($_.Exception.Message)"
             $Sync.StatusText = "Erro durante o processamento."
         } finally {
+            # Restaura a regra de rede no Firewall incondicionalmente
+            LiberarAcessoTerminaisRede
             $Sync.Concluido = $true
         }
     }
